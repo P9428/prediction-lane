@@ -280,6 +280,23 @@ def run() -> dict:
                 fields.update(roi=Decimal(0), roi_lo975=Decimal(-1), clv=Decimal(0), clv_lo975=Decimal(-1))
             ev.assertion(f"lag:{name}", f"lag:{name}", ("beatable", "efficient"), "beatable", k_as_of, fields,
                           dict(p=pr.get("p"), h=pr.get("h")))
+    plag = ROOT / "data" / "poly_lag_results.json"
+    if plag.exists():
+        ph = ROOT / "data" / "poly_hist.sqlite"
+        c = sqlite3.connect(ph)
+        p_as_of = ltime_of(c.execute("SELECT max(fetched_at) FROM price_pulls").fetchone()[0])
+        n_m = c.execute("SELECT count(*) FROM markets").fetchone()[0]
+        c.close()
+        ev.capture("poly_hist.sqlite", ph, p_as_of, dict(markets=n_m))
+        ev.capture("poly_lag_results.json", plag, p_as_of)
+        L = json.load(open(plag))
+        for name, pr in zip(("P1", "P2"), L["primaries"]):
+            fields = dict(roi=q(pr.get("roi")), roi_lo975=q(pr.get("roi_lo975")), clv=q(pr.get("clv")),
+                          clv_lo975=q(pr.get("clv_lo975")), n_bets=int(pr.get("n_bets", 0)), n_quoted=int(pr.get("n_quoted", 0)))
+            if any(v is None for v in fields.values()):
+                fields.update(roi=Decimal(0), roi_lo975=Decimal(-1), clv=Decimal(0), clv_lo975=Decimal(-1))
+            ev.assertion(f"lag:poly:{name}", f"lag:poly:{name}", ("beatable", "efficient"), "beatable", p_as_of, fields,
+                          dict(p=pr.get("p"), h=pr.get("h"), venue="polymarket"))
     # --- paper kill rules, from the settled journal (fields only when the counts exist)
     settled = ROOT / "journal" / "settled.jsonl"
     if settled.exists():
@@ -313,7 +330,7 @@ def run() -> dict:
         for sample in ("close", "open"):
             dcs = ev.decision(state, f"lane:{lg}:{sample}")
             verd["lane"][f"{lg}:{sample}"] = "NOT_ASSERTED" if dcs is None else ("INFORMATIVE" if dcs["has_belief"] else "REDUNDANT")
-    for name in ("P1", "P2"):
+    for name in ("P1", "P2", "poly:P1", "poly:P2"):
         dcs = ev.decision(state, f"lag:{name}")
         verd["lag"][name] = "NOT_MEASURED" if dcs is None else ("PASS" if dcs["has_belief"] else "FAIL")
     for k in ("K1", "K2", "K3"):

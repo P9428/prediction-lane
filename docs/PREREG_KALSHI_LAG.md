@@ -57,6 +57,19 @@ A pass licenses a forward paper test of the same rule with live quotes (the hour
 snapshot job), not real capital. A fail on both kills the "stale venue" lane for
 MLB/NFL on Kalshi; Polymarket is a separate measurement.
 
+## Addendum A (written 2026-10-01 before the Polymarket join or test ran): Polymarket
+
+Same P1/P2 rules and horizon on Polymarket's settled MLB/NFL moneyline markets
+(Gamma closed events, CLOB hourly `prices-history` for outcome 0). History carries
+mids only, so `ask_h = mid_h + 0.01` (the half-spread measured live today is 0.005;
+0.01 is the conservative side), `bid_h = mid_h − 0.01`, taker fee 0.05·p(1−p)
+(polymarket/docs/FINDINGS.md section 3), `venue_close` = last pre-start mid. Reported
+as `docs/POLY_LAG.md`; the evidence propositions are `lag:poly:P1` and `lag:poly:P2`
+under the same `lag-primary` rule. Four primaries in total across the two venues → the
+pass rule uses the 97.5% lower bound as before (already stricter than α/4 = 0.0125
+one-sided would require at 98.75%; a pass at 97.5% that fails at 98.75% is reported as
+MARGINAL, not PASS).
+
 ## Tripwire
 
 Any horizon, threshold, or fee changed after the first run is logged in TRIPWIRE.md.

@@ -1,6 +1,6 @@
-# VERDICT — read from the RI belief state, run c56f34af3058
+# VERDICT — read from the RI belief state, run 39f81d39cb6b
 
-log entries 18, root at read `c56f34af30581a89…`, file `data\evidence\pl_c56f34af3058.ri`; replay with `python -m pl.evidence replay data\evidence\pl_c56f34af3058.ri`
+log entries 26, root at read `39f81d39cb6bf598…`, file `data\evidence\pl_39f81d39cb6b.ri`; replay with `python -m pl.evidence replay data\evidence\pl_39f81d39cb6b.ri`
 
 | proposition | rule | verdict |
 |---|---|---|
@@ -12,8 +12,10 @@ log entries 18, root at read `c56f34af30581a89…`, file `data\evidence\pl_c56f3
 | lane:nhl:open | lane-informative v1 | **REDUNDANT** |
 | lane:nfl:close | lane-informative v1 | **REDUNDANT** |
 | lane:nfl:open | lane-informative v1 | **REDUNDANT** |
-| lag:P1 | lag-primary v1 | **NOT_MEASURED** |
-| lag:P2 | lag-primary v1 | **NOT_MEASURED** |
+| lag:P1 | lag-primary v1 | **FAIL** |
+| lag:P2 | lag-primary v1 | **FAIL** |
+| lag:poly:P1 | lag-primary v1 | **FAIL** |
+| lag:poly:P2 | lag-primary v1 | **FAIL** |
 | kill:K1 | paper-K1 v1 | **NOT_ASSERTED** |
 | kill:K2 | paper-K2 v1 | **NOT_ASSERTED** |
 | kill:K3 | paper-K3 v1 | **NOT_ASSERTED** |

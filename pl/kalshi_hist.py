@@ -48,10 +48,10 @@ def get(url, params, tries=4):
             r = _s.get(url, params=params, timeout=60)
             if r.status_code == 200:
                 return r.json()
-            if r.status_code == 429:
-                time.sleep(2.0 * (i + 1))
-                continue
             last = RuntimeError(f"{r.status_code} {r.text[:120]}")
+            if r.status_code == 429:
+                time.sleep(3.0 * (i + 1))
+                continue
         except requests.RequestException as e:
             last = e
         time.sleep(0.5 * (i + 1))
@@ -112,7 +112,8 @@ def pull_candles(c: sqlite3.Connection, series: str, workers: int = 4) -> int:
 
 
 def main(argv=None):
-    series = (argv or sys.argv[1:]) or ["KXMLBGAME", "KXNFLGAME"]
+    args = [a for a in (argv or sys.argv[1:]) if not a.startswith("--")]
+    series = args or ["KXMLBGAME", "KXNFLGAME"]
     c = sqlite3.connect(DB, timeout=120)
     c.executescript(SCHEMA)
     for s in series:

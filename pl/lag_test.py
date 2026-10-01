@@ -39,12 +39,14 @@ def load_kalshi() -> pd.DataFrame:
         if not g:
             continue
         d = datetime.strptime(g["date"], "%y%b%d").date()
+        hhmm = g["time"] or "1200"
+        kdt = pd.Timestamp(datetime.strptime(g["date"] + hhmm, "%y%b%d%H%M")).tz_localize("US/Eastern").tz_convert("UTC")
         teams, side = g["teams"], g["side"]
         if not teams.endswith(side) and not teams.startswith(side):
             continue
         other = teams[: -len(side)] if teams.endswith(side) else teams[len(side):]
-        rows.append(dict(ticker=r.ticker, league=r.series.replace("GAME", "").lower(), event_ticker=r.event_ticker,
-                         kdate=d, side=CODE.get(side, side), other=CODE.get(other, other),
+        rows.append(dict(ticker=r.ticker, league=r.series[2:].replace("GAME", "").lower(), event_ticker=r.event_ticker,
+                         kdate=d, kdt=kdt, has_time=bool(g["time"]), side=CODE.get(side, side), other=CODE.get(other, other),
                          side_is_home=teams.endswith(side), result=r.result, volume=r.volume))
     km = pd.DataFrame(rows)
     return km, cd
@@ -67,10 +69,18 @@ def join(km: pd.DataFrame, cd: pd.DataFrame) -> pd.DataFrame:
         k = km[km.league == lg]
         for r in k.itertuples(index=False):
             home, away = (r.side, r.other) if r.side_is_home else (r.other, r.side)
-            cand = g[(g.home_abbr == home) & (g.away_abbr == away) & ((g.edate_et - r.kdate).abs() <= pd.Timedelta(days=1))]
-            if len(cand) != 1:
-                continue
-            x = cand.iloc[0]
+            cand = g[(g.home_abbr == home) & (g.away_abbr == away)]
+            if r.has_time:
+                dt = (cand.start - r.kdt).abs()
+                cand = cand[dt <= pd.Timedelta(hours=6)]
+                if cand.empty:
+                    continue
+                x = cand.loc[dt[cand.index].idxmin()]
+            else:
+                cand = cand[(cand.edate_et - r.kdate).abs() <= pd.Timedelta(days=1)]
+                if len(cand) != 1:
+                    continue
+                x = cand.iloc[0]
             out.append(dict(ticker=r.ticker, league=lg, event_id=x.event_id, start=x.start, home=home, away=away,
                             side_is_home=r.side_is_home, result=r.result, volume=r.volume, y_home=x.y,
                             p_open_shin=x.p_open_shin, p_close_shin=x.p_close_shin, p_model=x.p_model,
@@ -110,16 +120,79 @@ def join(km: pd.DataFrame, cd: pd.DataFrame) -> pd.DataFrame:
     return j
 
 
-def net_dec(ask: np.ndarray) -> np.ndarray:
-    return 1.0 / (ask + FEE * ask * (1 - ask))
+POLY_FEE = 0.05
+POLY_HALF_SPREAD = 0.01
+VENUE_FEE = {"kalshi": FEE, "polymarket": POLY_FEE}
 
 
-def rule(j: pd.DataFrame, p_col: str, h: int, B: int = 2000, seed: int = 0) -> dict:
+def load_poly_join() -> pd.DataFrame:
+    """Polymarket closed moneyline markets -> the same joined frame as join(),
+    two side rows per market, prices from the outcome-0 hourly mid."""
+    from pl.poly_hist import DB as PDB
+    from pl.paper import team_display_names
+    c = sqlite3.connect(PDB)
+    m = pd.read_sql("SELECT * FROM markets", c)
+    pr = pd.read_sql("SELECT * FROM prices", c)
+    c.close()
+    by = {t: d.sort_values("ts") for t, d in pr.groupby("token")}
+    out = []
+    for lg in sorted(m.league.unique()):
+        g = load_games(lg)
+        from pl import espn
+        sport, lgx = espn.LEAGUES[lg]
+        tj = espn.get(f"{espn.SITE}/{sport}/{lgx}/teams?limit=100")
+        abbr_by_name = {t["team"]["displayName"]: t["team"]["abbreviation"] for t in tj["sports"][0]["leagues"][0]["teams"]}
+        id_by_name = abbr_by_name
+        abbr_by_id = abbr_by_name
+        gs = g.copy()
+        gs["start_ts"] = gs.start.astype("int64") // 10 ** 9
+        for r in m[m.league == lg].itertuples(index=False):
+            o = json.loads(r.outcomes)
+            if len(o) != 2 or o[0] not in id_by_name or o[1] not in id_by_name:
+                continue
+            a0, a1 = abbr_by_name[o[0]], abbr_by_name[o[1]]
+            t0 = pd.Timestamp(r.game_start.replace(" ", "T")).tz_localize("UTC") if pd.Timestamp(r.game_start.replace(" ", "T")).tz is None else pd.Timestamp(r.game_start.replace(" ", "T"))
+            cand = gs[(((gs.home_abbr == a0) & (gs.away_abbr == a1)) | ((gs.home_abbr == a1) & (gs.away_abbr == a0))) &
+                      ((gs.start - t0).abs() <= pd.Timedelta(hours=3))]
+            if len(cand) != 1:
+                continue
+            x = cand.iloc[0]
+            d = by.get(r.token0)
+            if d is None or d.empty:
+                continue
+            st = int(x.start_ts)
+            for side_abbr, is0 in ((a0, True), (a1, False)):
+                side_is_home = (x.home_abbr == side_abbr)
+                row = dict(ticker=f"{r.condition_id[:10]}:{side_abbr}", league=lg, event_id=x.event_id, start=x.start, home=x.home_abbr,
+                           away=x.away_abbr, side_is_home=side_is_home, result=None, volume=r.volume, y_home=x.y,
+                           p_open_shin=x.p_open_shin, p_close_shin=x.p_close_shin, p_model=x.p_model,
+                           p_blend_open=x.p_blend_open, p_blend=x.p_blend)
+                for h in H_ALL:
+                    dd = d[d.ts <= st - h * 3600]
+                    mid = (dd.p.iloc[-1] if is0 else 1 - dd.p.iloc[-1]) if len(dd) else np.nan
+                    row[f"ask_{h}"], row[f"bid_{h}"] = mid + POLY_HALF_SPREAD, mid - POLY_HALF_SPREAD
+                dd = d[d.ts <= st]
+                row["kalshi_close"] = (dd.p.iloc[-1] if is0 else 1 - dd.p.iloc[-1]) if len(dd) else np.nan
+                out.append(row)
+    j = pd.DataFrame(out)
+    for cname in ("p_open_shin", "p_close_shin", "p_model", "p_blend_open", "p_blend"):
+        j[f"{cname}_side"] = np.where(j.side_is_home, j[cname], 1 - j[cname])
+    j["y_side"] = np.where(j.side_is_home, j.y_home, 1 - j.y_home)
+    j["y_kalshi"] = j.y_side
+    j["date"] = j.start.dt.floor("D").values.astype("datetime64[D]")
+    return j
+
+
+def net_dec(ask: np.ndarray, fee: float = FEE) -> np.ndarray:
+    return 1.0 / (ask + fee * ask * (1 - ask))
+
+
+def rule(j: pd.DataFrame, p_col: str, h: int, B: int = 2000, seed: int = 0, fee: float = FEE) -> dict:
     """Buy one $1 contract of a side at its ask when p_side * net_dec - 1 > EDGE_MIN."""
     a = j[f"ask_{h}"].values
     p = j[f"{p_col}_side"].values
     ok = np.isfinite(a) & np.isfinite(p) & (a > 0) & (a < 1)
-    dec = net_dec(np.where(ok, a, 0.5))
+    dec = net_dec(np.where(ok, a, 0.5), fee)
     edge = p * dec - 1
     bet = ok & (edge > EDGE_MIN)
     y = j.y_side.values
@@ -190,17 +263,23 @@ def render(j: pd.DataFrame, res: list[dict], prim: list[dict]) -> str:
     return "\n".join(L) + "\n"
 
 
-def main():
-    km, cd = load_kalshi()
-    j = join(km, cd)
-    j.to_csv(ROOT / "data" / "kalshi_lag_rows.csv", index=False)
-    prim = [rule(j, "p_open_shin", H_PRIMARY), rule(j, "p_blend_open", H_PRIMARY)]
-    res = [rule(j, p, h, B=1000) for p in ("p_open_shin", "p_blend_open", "p_model", "p_close_shin", "p_blend") for h in H_ALL]
-    md = render(j, res, prim)
-    (ROOT / "docs" / "KALSHI_LAG.md").write_text(md, encoding="utf-8")
-    json.dump(dict(primaries=prim, diagnostics=res), open(ROOT / "data" / "kalshi_lag_results.json", "w"), indent=1, default=float)
-    print(md[:3000])
+def main(venue: str = "kalshi"):
+    if venue == "kalshi":
+        km, cd = load_kalshi()
+        j = join(km, cd)
+    else:
+        j = load_poly_join()
+    fee = VENUE_FEE[venue]
+    tag = "kalshi" if venue == "kalshi" else "poly"
+    j.to_csv(ROOT / "data" / f"{tag}_lag_rows.csv", index=False)
+    prim = [rule(j, "p_open_shin", H_PRIMARY, fee=fee), rule(j, "p_blend_open", H_PRIMARY, fee=fee)]
+    res = [rule(j, p, h, B=1000, fee=fee) for p in ("p_open_shin", "p_blend_open", "p_model", "p_close_shin", "p_blend") for h in H_ALL]
+    md = render(j, res, prim).replace("# Kalshi lag test", f"# {venue} lag test")
+    (ROOT / "docs" / f"{tag.upper()}_LAG.md").write_text(md, encoding="utf-8")
+    json.dump(dict(venue=venue, primaries=prim, diagnostics=res), open(ROOT / "data" / f"{tag}_lag_results.json", "w"), indent=1, default=float)
+    print(md[:3500])
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+    main(sys.argv[1] if len(sys.argv) > 1 else "kalshi")
