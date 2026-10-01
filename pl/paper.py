@@ -359,6 +359,12 @@ def status() -> None:
         L.append("Paired (book − model) log-loss, positive = model better: "
                  + (f"{(d.ll_book - d.ll_model).mean():+.4f} on {int((d.ll_book.notna() & d.ll_model.notna()).sum())} games"
                     if "ll_book" in d and "ll_model" in d else "n/a"))
+    cl = [r for r in rows if r["kind"] == "clv"]
+    if cl:
+        c = pd.DataFrame(cl)
+        L.append(f"CLV vs Kalshi pre-start mid: forecast side mean {c.forecast_clv.mean():+.4f} on {len(c)} games "
+                 f"(share > 0: {(c.forecast_clv > 0).mean():.3f})"
+                 + (f"; tickets mean {c.ticket_clv.mean():+.4f} on {c.ticket_clv.notna().sum()}" if "ticket_clv" in c and c.ticket_clv.notna().any() else ""))
     if ticks:
         t = pd.DataFrame(ticks)
         cum = t.pnl.cumsum()
@@ -372,15 +378,96 @@ def status() -> None:
     print("\n".join(L))
 
 
+# ---------------------------------------------------------------- quote snapshots (lead-lag dataset) and CLV
+SNAP = J / "quotes.jsonl"
+
+
+def snapshot() -> None:
+    """Hourly: every pending prediction's Kalshi/Polymarket quotes and the DraftKings
+    line right now. Builds the forward lead-lag dataset the backtest cannot supply."""
+    pend = [p for p in _read(PRED) if pd.Timestamp(p["start"]) > pd.Timestamp.now(tz="UTC")]
+    if not pend:
+        print("no pending games")
+        return
+    by_lg: dict[str, list[dict]] = {}
+    for p in pend:
+        by_lg.setdefault(p["league"], []).append(p)
+    n = 0
+    for lg, ps in by_lg.items():
+        km, pm, names = kalshi_quotes(lg), polymarket_quotes(lg), team_display_names(lg)
+        live = {}
+        for d in {pd.Timestamp(p["start"]).date() for p in ps}:
+            for e in espn.scoreboard(lg, d):
+                r = espn.parse_event(lg, e)
+                live[r["event_id"]] = r
+        for p in ps:
+            g = pd.Series(dict(home_abbr=p["home"], away_abbr=p["away"], home_id=p["home_id"], away_id=p["away_id"],
+                               start=pd.Timestamp(p["start"])))
+            r = live.get(p["event_id"], {})
+            _append(SNAP, dict(ts=_now(), event_id=p["event_id"], league=lg, start=p["start"],
+                               hours_to_start=round((pd.Timestamp(p["start"]) - pd.Timestamp.now(tz="UTC")).total_seconds() / 3600, 2),
+                               kalshi=match_kalshi(g, km), polymarket=match_polymarket(g, pm, names),
+                               sportsbook=dict(ml_home=r.get("live_ml_home"), ml_away=r.get("live_ml_away"), provider=r.get("live_provider"))))
+            n += 1
+    print(f"snapshot: {n} games")
+
+
+def clv() -> None:
+    """Closing-line value for every settled ticket and every forecast: the Kalshi
+    pre-start mid minus the price we paid (ticket) or the price that was available
+    when the forecast was written (forecast side = the blend's favoured side)."""
+    from pl.kalshi_hist import candles as kcandles
+    rows = _read(SETTLED)
+    done = {r["event_id"] for r in rows if r["kind"] == "clv"}
+    preds = {p["event_id"]: p for p in _read(PRED)}
+    ticks = {t["event_id"]: t for t in _read(TICK)}
+    n = 0
+    for ev, p in preds.items():
+        if ev in done or pd.Timestamp(p["start"]) > pd.Timestamp.now(tz="UTC"):
+            continue
+        kq = p.get("kalshi") or {}
+        if "home" not in kq:
+            continue
+        tk = kq["home"]["ticker"]
+        ser = tk.split("-")[0]
+        try:
+            cs = kcandles(ser, tk, (pd.Timestamp(p["start"]) - pd.Timedelta(days=14)).isoformat(), pd.Timestamp(p["start"]).isoformat())
+        except Exception as e:  # noqa: BLE001
+            print(f"  clv {tk} ERR {e}")
+            continue
+        st = int(pd.Timestamp(p["start"]).timestamp())
+        pre = [c for c in cs if c[1] <= st and c[2] is not None and c[3] is not None and (c[3] - c[2]) <= 0.10]
+        if not pre:
+            continue
+        close_home = (pre[-1][2] + pre[-1][3]) / 2
+        side = "home" if (p.get("p_blend") or 0.5) >= 0.5 else "away"
+        paid = kq[side]["ask"]
+        close_side = close_home if side == "home" else 1 - close_home
+        row = dict(kind="clv", ts=_now(), event_id=ev, league=p["league"], day=p["day"], forecast_side=side,
+                   forecast_ask=paid, kalshi_close_side=close_side, forecast_clv=round(close_side - paid, 4))
+        t = ticks.get(ev)
+        if t and t.get("venue") == "kalshi":
+            tc = close_home if t["side"] == "home" else 1 - close_home
+            row.update(ticket_side=t["side"], ticket_ask=t["ask"], ticket_clv=round(tc - t["ask"], 4))
+        _append(SETTLED, row)
+        n += 1
+    print(f"clv rows: {n}")
+
+
 def main(argv=None):
     a = argv or sys.argv[1:]
     cmd = a[0] if a else "tickets"
     if cmd == "tickets":
         tickets(date.fromisoformat(a[1]) if len(a) > 1 else None)
     elif cmd == "settle":
+        clv()
         settle()
     elif cmd == "status":
         status()
+    elif cmd == "snapshot":
+        snapshot()
+    elif cmd == "clv":
+        clv()
     else:
         raise SystemExit(__doc__)
 
