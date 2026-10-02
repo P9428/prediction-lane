@@ -1,6 +1,6 @@
-# VERDICT — read from the RI belief state, run 39f81d39cb6b
+# VERDICT — read from the RI belief state, run c23a130d565a
 
-log entries 26, root at read `39f81d39cb6bf598…`, file `data\evidence\pl_39f81d39cb6b.ri`; replay with `python -m pl.evidence replay data\evidence\pl_39f81d39cb6b.ri`
+log entries 27, root at read `c23a130d565a1601…`, file `data\evidence\pl_c23a130d565a.ri`; replay with `python -m pl.evidence replay data\evidence\pl_c23a130d565a.ri`
 
 | proposition | rule | verdict |
 |---|---|---|
@@ -16,7 +16,7 @@ log entries 26, root at read `39f81d39cb6bf598…`, file `data\evidence\pl_39f81
 | lag:P2 | lag-primary v1 | **FAIL** |
 | lag:poly:P1 | lag-primary v1 | **FAIL** |
 | lag:poly:P2 | lag-primary v1 | **FAIL** |
-| kill:K1 | paper-K1 v1 | **NOT_ASSERTED** |
+| kill:K1 | paper-K1 v1 | **LIVE** |
 | kill:K2 | paper-K2 v1 | **NOT_ASSERTED** |
 | kill:K3 | paper-K3 v1 | **NOT_ASSERTED** |
 
