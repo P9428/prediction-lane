@@ -300,7 +300,7 @@ def settle() -> None:
     pending = [p for p in preds if ("pred", p["event_id"]) not in done] + [t for t in ticks if ("ticket", t["event_id"]) not in done]
     days = {(p["league"], pd.Timestamp(p["start"]).date()) for p in pending}
     for lg, d in days:
-        for dd in (d, d + timedelta(days=1)):
+        for dd in (d - timedelta(days=1), d, d + timedelta(days=1)):
             for e in espn.scoreboard(lg, dd):
                 r = espn.parse_event(lg, e)
                 if r["completed"] and r["home_score"] is not None:
