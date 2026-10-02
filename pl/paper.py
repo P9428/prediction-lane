@@ -359,8 +359,8 @@ def status() -> str:
         L += ["| forecast | n | mean log-loss |", "|---|---|---|"]
         L += [f"| {c[3:]} | {d[c].notna().sum()} | {d[c].mean():.4f} |" for c in d.columns if c.startswith("ll_")]
         L.append("")
-        paired = (f"{(d.ll_book - d.ll_model).mean():+.4f} on {int((d.ll_book.notna() & d.ll_model.notna()).sum())} games"
-                  if "ll_book" in d and "ll_model" in d else "n/a")
+        paired = (f"{(d.ll_book - d.ll_p_model).mean():+.4f} on {int((d.ll_book.notna() & d.ll_p_model.notna()).sum())} games"
+                  if "ll_book" in d and "ll_p_model" in d else "n/a")
         L.append(f"Paired (book − model) log-loss, positive = model better: {paired}")
     cl = [r for r in rows if r["kind"] == "clv"]
     if cl:

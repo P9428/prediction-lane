@@ -1,4 +1,4 @@
-# paper status — 2026-10-02T15:57:12+00:00
+# paper status — 2026-10-02T15:58:34+00:00
 
 predictions settled: 10   tickets settled: 0   pending tickets: 1
 
@@ -14,5 +14,5 @@ predictions settled: 10   tickets settled: 0   pending tickets: 1
 | p_pois_pitch | 1 | 0.5882 |
 | polymarket | 1 | 0.6833 |
 
-Paired (book − model) log-loss, positive = model better: n/a
+Paired (book − model) log-loss, positive = model better: -0.0209 on 10 games
 CLV vs Kalshi pre-start mid: forecast side mean +0.0000 on 10 games (share > 0: 0.500)

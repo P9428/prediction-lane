@@ -80,6 +80,7 @@ def test_settle_ticket_pnl_and_status_page(journal, monkeypatch, capsys):
     page = paper.STATUS_MD.read_text(encoding="utf-8")
     assert "predictions settled: 1   tickets settled: 1   pending tickets: 1" in page
     assert "| p_model | 1 |" in page and "tickets: 1  staked $7.67  pnl $-7.67" in page
+    assert f"Paired (book − model) log-loss, positive = model better: {-math.log(0.4247) + math.log(0.46):+.4f} on 1 games" in page
     out = capsys.readouterr().out.splitlines()
     assert out[out.index("settled 2 rows") + 1:] == page.splitlines()
 

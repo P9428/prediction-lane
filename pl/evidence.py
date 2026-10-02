@@ -275,10 +275,10 @@ def run() -> dict:
     settled = JOURNAL / "settled.jsonl"
     if settled.exists():
         rows = read_jsonl(settled)
-        preds = [x for x in rows if x["kind"] == "pred" and "ll_book" in x and "ll_model" in x]
+        preds = [x for x in rows if x["kind"] == "pred" and "ll_book" in x and "ll_p_model" in x]
         ticks = [x for x in rows if x["kind"] == "ticket"]
         t_as_of = max((epoch(x["ts"]) for x in rows), default=as_of)
-        d = np.array([x["ll_book"] - x["ll_model"] for x in preds]) if preds else np.array([])
+        d = np.array([x["ll_book"] - x["ll_p_model"] for x in preds]) if preds else np.array([])
         d_hi = (d.mean() + 1.96 * d.std(ddof=1) / math.sqrt(len(d))) if len(d) > 1 else 1.0
         ev.assertion("kill:K1", "kill:K1", ("kill", "live"), "kill", t_as_of,
                      dict(n_games=len(preds), d_ll_mean=q(d.mean()) if len(d) else Decimal(0), d_ll_ci_hi=q(d_hi)))
