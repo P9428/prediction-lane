@@ -5,21 +5,17 @@ Idempotent: markets already holding candles are skipped.
 """
 from __future__ import annotations
 
+import argparse
 import json
 import sqlite3
-import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
-from pathlib import Path
 
-import requests
+from pl import http, store
+from pl.core import DATA, configure_logging, epoch, log, to_float, utc_now
 
-ROOT = Path(__file__).resolve().parents[1]
-DB = ROOT / "data" / "kalshi_hist.sqlite"
+DB = DATA / "kalshi_hist.sqlite"
 B = "https://api.elections.kalshi.com/trade-api/v2"
-_s = requests.Session()
-_s.headers["User-Agent"] = "Mozilla/5.0 prediction-lane/0.1"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS markets (ticker TEXT PRIMARY KEY, series TEXT, event_ticker TEXT, title TEXT, sub TEXT,
@@ -30,32 +26,9 @@ CREATE TABLE IF NOT EXISTS candle_pulls (ticker TEXT PRIMARY KEY, n INTEGER, fet
 """
 
 
-def _ts(iso: str) -> int:
-    return int(datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp())
-
-
-def _f(x):
-    try:
-        return float(x)
-    except (TypeError, ValueError):
-        return None
-
-
-def get(url, params, tries=4):
-    last = None
-    for i in range(tries):
-        try:
-            r = _s.get(url, params=params, timeout=60)
-            if r.status_code == 200:
-                return r.json()
-            last = RuntimeError(f"{r.status_code} {r.text[:120]}")
-            if r.status_code == 429:
-                time.sleep(3.0 * (i + 1))
-                continue
-        except requests.RequestException as e:
-            last = e
-        time.sleep(0.5 * (i + 1))
-    raise last
+def get(url: str, params: dict) -> dict:
+    """Kalshi GET: every non-200 is retried, 429 with the long back-off."""
+    return http.get_json(url, params, timeout=60, tries=4, backoff=0.5, fatal=())
 
 
 def pull_markets(c: sqlite3.Connection, series: str) -> int:
@@ -64,8 +37,8 @@ def pull_markets(c: sqlite3.Connection, series: str) -> int:
         j = get(f"{B}/markets", dict(limit=1000, status="settled", series_ticker=series, cursor=cur))
         ms = j.get("markets", [])
         rows = [(m["ticker"], series, m.get("event_ticker"), m.get("title"), m.get("yes_sub_title"), m.get("open_time"),
-                 m.get("close_time"), m.get("expected_expiration_time"), m.get("result"), _f(m.get("volume_fp")),
-                 json.dumps(m, separators=(",", ":")), datetime.now(timezone.utc).isoformat(timespec="seconds")) for m in ms]
+                 m.get("close_time"), m.get("expected_expiration_time"), m.get("result"), to_float(m.get("volume_fp")),
+                 json.dumps(m, separators=(",", ":")), utc_now()) for m in ms]
         with c:
             c.executemany("INSERT OR REPLACE INTO markets VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", rows)
         n += len(ms)
@@ -77,13 +50,13 @@ def pull_markets(c: sqlite3.Connection, series: str) -> int:
 
 def candles(series: str, ticker: str, open_time: str, close_time: str) -> list[tuple]:
     j = get(f"{B}/series/{series}/markets/{ticker}/candlesticks",
-            dict(start_ts=_ts(open_time) - 3600, end_ts=_ts(close_time) + 3600, period_interval=60))
+            dict(start_ts=epoch(open_time) - 3600, end_ts=epoch(close_time) + 3600, period_interval=60))
     out = []
     for x in j.get("candlesticks", []):
         p = x.get("price") or {}
-        out.append((ticker, int(x["end_period_ts"]), _f((x.get("yes_bid") or {}).get("close_dollars")),
-                    _f((x.get("yes_ask") or {}).get("close_dollars")), _f(p.get("close_dollars")), _f(p.get("mean_dollars")),
-                    _f(x.get("volume_fp")), _f(x.get("open_interest_fp"))))
+        out.append((ticker, int(x["end_period_ts"]), to_float((x.get("yes_bid") or {}).get("close_dollars")),
+                    to_float((x.get("yes_ask") or {}).get("close_dollars")), to_float(p.get("close_dollars")), to_float(p.get("mean_dollars")),
+                    to_float(x.get("volume_fp")), to_float(x.get("open_interest_fp"))))
     return out
 
 
@@ -100,27 +73,30 @@ def pull_candles(c: sqlite3.Connection, series: str, workers: int = 4) -> int:
             try:
                 rows = f.result()
             except Exception as e:  # noqa: BLE001
-                print(f"  {tk} ERR {e}", file=sys.stderr, flush=True)
+                log.warning("%s: %s", tk, e)
                 continue
             with c:
                 c.executemany("INSERT OR REPLACE INTO candles VALUES (?,?,?,?,?,?,?,?)", rows)
-                c.execute("INSERT OR REPLACE INTO candle_pulls VALUES (?,?,?)", (tk, len(rows), datetime.now(timezone.utc).isoformat(timespec="seconds")))
+                c.execute("INSERT OR REPLACE INTO candle_pulls VALUES (?,?,?)", (tk, len(rows), utc_now()))
             done += 1
             if done % 100 == 0:
                 print(f"  {series} candles {done}/{len(todo)} {time.time() - t0:.0f}s", flush=True)
     return done
 
 
-def main(argv=None):
-    args = [a for a in (argv or sys.argv[1:]) if not a.startswith("--")]
-    series = args or ["KXMLBGAME", "KXNFLGAME"]
-    c = sqlite3.connect(DB, timeout=120)
-    c.executescript(SCHEMA)
-    for s in series:
-        n = pull_markets(c, s)
-        print(f"{s}: {n} settled markets", flush=True)
-        pull_candles(c, s)
-    c.close()
+def main(argv: list[str] | None = None) -> None:
+    configure_logging()
+    ap = argparse.ArgumentParser(prog="pl kalshi-hist", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("series", nargs="*", default=["KXMLBGAME", "KXNFLGAME"])
+    ap.add_argument("--workers", type=int, default=4)
+    a = ap.parse_args(argv)
+    c = store.open_db(DB, SCHEMA, wal=False)
+    try:
+        for ser in a.series:
+            print(f"{ser}: {pull_markets(c, ser)} settled markets", flush=True)
+            pull_candles(c, ser, a.workers)
+    finally:
+        c.close()
 
 
 if __name__ == "__main__":

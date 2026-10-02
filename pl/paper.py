@@ -1,8 +1,10 @@
 """Paper trading loop. Pre-game, hold to settlement, taker side, one ticket per game.
 
-  python -m pl.paper tickets   # today's slate: model probabilities, every venue's quote, tickets
-  python -m pl.paper settle    # settle pending predictions and tickets from ESPN finals
-  python -m pl.paper status    # running scoreboard (docs/PAPER_STATUS.md)
+  python -m pl paper tickets [DAY]   # today's slate: model probabilities, every venue's quote, tickets
+  python -m pl paper settle          # CLV, then settle pending predictions and tickets from ESPN finals
+  python -m pl paper status          # running scoreboard (docs/PAPER_STATUS.md)
+  python -m pl paper snapshot        # hourly venue quotes for every pending game (lead-lag dataset)
+  python -m pl paper clv             # closing-line value only
 
 Every game on the slate gets a PREDICTION row (model, blend, each venue's price)
 whether or not a ticket is written, so the forecast is scored on every game and
@@ -11,66 +13,57 @@ docs/PREREGISTRATION.md.
 """
 from __future__ import annotations
 
+import argparse
 import json
-import sys
-from datetime import date, datetime, timedelta, timezone
-from pathlib import Path
+from datetime import UTC, date, datetime, timedelta
 
 import numpy as np
 import pandas as pd
-import requests
 
-from pl import backtest, espn, models, stats, store
+from pl import backtest, espn, http, models, stats
+from pl.core import DATA, DOCS, JOURNAL, append_jsonl, configure_logging, finite, load_json, log, read_jsonl, utc_now, write_text
 
-ROOT = Path(__file__).resolve().parents[1]
-J = ROOT / "journal"
-PRED = J / "predictions.jsonl"
-TICK = J / "tickets.jsonl"
-SETTLED = J / "settled.jsonl"
+PRED = JOURNAL / "predictions.jsonl"
+TICK = JOURNAL / "tickets.jsonl"
+SETTLED = JOURNAL / "settled.jsonl"
+SNAP = JOURNAL / "quotes.jsonl"
+STATUS_MD = DOCS / "PAPER_STATUS.md"
+BACKTEST_RESULTS = DATA / "backtest_results.json"
 
 BANKROLL = 1000.0
 RULE = stats.BetRule(edge_min=0.02, kelly_frac=0.25, stake_cap=0.02, bankroll=BANKROLL)
 KALSHI_FEE = 0.07      # taker fee rate per contract: fee = 0.07 * p * (1-p)   (docs: trading fees)
 POLY_FEE = 0.05        # measured live sports taker rate, polymarket/docs/FINDINGS.md section 3
+VENUE_FEE = {"kalshi": KALSHI_FEE, "polymarket": POLY_FEE}
 KALSHI_SERIES = {"mlb": "KXMLBGAME", "nhl": "KXNHLGAME", "nba": "KXNBAGAME", "nfl": "KXNFLGAME"}
 POLY_TAG = {"mlb": "mlb", "nhl": "nhl", "nba": "nba", "nfl": "nfl"}
-
-_s = requests.Session()
-_s.headers["User-Agent"] = "Mozilla/5.0 prediction-lane/0.1"
-
-
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+KALSHI_API = "https://api.elections.kalshi.com/trade-api/v2"
+GAMMA_API = "https://gamma-api.polymarket.com"
+SLATE_HORIZON = timedelta(hours=30)
+LOG_LOSS_FLOOR = 1e-6
+FORECAST_COLS = ("p_model", "p_blend", "p_elo", "p_gauss", "p_pois", "p_pois_pitch")
 
 
-def _append(path: Path, row: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "a", encoding="utf-8") as fh:
-        fh.write(json.dumps(row, default=float) + "\n")
-
-
-def _read(path: Path) -> list[dict]:
-    if not path.exists():
-        return []
-    return [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines() if l.strip()]
+def _now_ts() -> pd.Timestamp:
+    return pd.Timestamp.now(tz="UTC")
 
 
 # ---------------------------------------------------------------- slate
 def slate(day: date) -> pd.DataFrame:
+    """Scheduled regular/post-season games starting within the horizon, all leagues."""
     rows = []
     for lg in espn.LEAGUES:
         for d in (day, day + timedelta(days=1)):
             for e in espn.scoreboard(lg, d):
                 r = espn.parse_event(lg, e)
-                if r["status"] != "STATUS_SCHEDULED" or r["season_type"] not in (2, 3):
-                    continue
-                rows.append(r)
+                if r["status"] == "STATUS_SCHEDULED" and r["season_type"] in (2, 3):
+                    rows.append(r)
     df = pd.DataFrame(rows).drop_duplicates("event_id")
     if df.empty:
         return df
     df["start"] = pd.to_datetime(df["start"], utc=True)
-    now = datetime.now(timezone.utc)
-    df = df[(df.start > now) & (df.start < now + timedelta(hours=30))]
+    now = datetime.now(UTC)
+    df = df[(df.start > now) & (df.start < now + SLATE_HORIZON)]
     return df.sort_values("start").reset_index(drop=True)
 
 
@@ -126,51 +119,40 @@ def kalshi_quotes(league: str) -> list[dict]:
         return []
     out, cur = [], ""
     while True:
-        j = _s.get("https://api.elections.kalshi.com/trade-api/v2/markets",
-                   params=dict(limit=200, status="open", series_ticker=ser, cursor=cur), timeout=30).json()
+        j = http.get_json(f"{KALSHI_API}/markets", dict(limit=200, status="open", series_ticker=ser, cursor=cur), fatal=())
         out += j.get("markets", [])
         cur = j.get("cursor") or ""
         if not cur:
-            break
-    return out
+            return out
 
 
 def polymarket_quotes(league: str) -> list[dict]:
     tag = POLY_TAG.get(league)
     if not tag:
         return []
-    j = _s.get("https://gamma-api.polymarket.com/events", params=dict(limit=200, closed="false", tag_slug=tag), timeout=60).json()
-    out = []
-    for e in j:
-        for m in e.get("markets", []):
-            if m.get("sportsMarketType") == "moneyline" and m.get("gameStartTime"):
-                out.append(dict(event=e.get("title"), question=m.get("question"), start=m.get("gameStartTime"),
-                                outcomes=json.loads(m.get("outcomes") or "[]"), prices=json.loads(m.get("outcomePrices") or "[]"),
-                                best_bid=m.get("bestBid"), best_ask=m.get("bestAsk"), liquidity=m.get("liquidityNum"),
-                                condition_id=m.get("conditionId"), tokens=json.loads(m.get("clobTokenIds") or "[]")))
-    return out
+    events = http.get_json(f"{GAMMA_API}/events", dict(limit=200, closed="false", tag_slug=tag), timeout=60, fatal=())
+    return [dict(event=e.get("title"), question=m.get("question"), start=m.get("gameStartTime"),
+                 outcomes=json.loads(m.get("outcomes") or "[]"), prices=json.loads(m.get("outcomePrices") or "[]"),
+                 best_bid=m.get("bestBid"), best_ask=m.get("bestAsk"), liquidity=m.get("liquidityNum"),
+                 condition_id=m.get("conditionId"), tokens=json.loads(m.get("clobTokenIds") or "[]"))
+            for e in events for m in e.get("markets", [])
+            if m.get("sportsMarketType") == "moneyline" and m.get("gameStartTime")]
 
 
-def _abbr_match(abbr: str, name: str, team_names: dict) -> bool:
-    return abbr == name or team_names.get(abbr, "").lower() in (name or "").lower() or (name or "").lower() in team_names.get(abbr, "").lower()
-
-
-KALSHI_ABBR = {"NYY": "New York Y", "NYM": "New York M", "CHW": "Chicago WS", "CWS": "Chicago WS", "CHC": "Chicago C", "LAD": "Los Angeles D",
-               "LAA": "Los Angeles A", "SF": "San Francisco", "SD": "San Diego", "TB": "Tampa Bay", "KC": "Kansas City", "STL": "St. Louis",
-               "WSH": "Washington", "ATH": "Athletics", "AZ": "Arizona", "ARI": "Arizona"}
+KALSHI_CODE = {"CHW": "CWS", "AZ": "ARI"}   # ESPN abbreviation -> Kalshi team code where they differ
 
 
 def match_kalshi(game, markets: list[dict]) -> dict:
     """Both sides' bid/ask for one game. Kalshi tickers end in the team code;
-    ESPN codes mostly match (CHW vs CWS, ATH handled)."""
-    code = {"CHW": "CWS", "AZ": "ARI"}
-    h, a = code.get(game.home_abbr, game.home_abbr), code.get(game.away_abbr, game.away_abbr)
+    the event ticker carries the local date, so the date match falls back to the
+    team pair alone (the quote feed only holds open markets, i.e. within ~36h)."""
+    h, a = KALSHI_CODE.get(game.home_abbr, game.home_abbr), KALSHI_CODE.get(game.away_abbr, game.away_abbr)
     day = game.start.strftime("%y%b%d").upper()
-    cands = [m for m in markets if m["event_ticker"].split("-")[1].startswith(day) and
-             (m["event_ticker"].endswith(f"{a}{h}") or m["event_ticker"].endswith(f"{h}{a}"))]
-    if not cands:
-        # same event may be dated by local time; fall back to team pair only within 36h
-        cands = [m for m in markets if (m["event_ticker"].endswith(f"{a}{h}") or m["event_ticker"].endswith(f"{h}{a}"))]
+
+    def pair(m: dict) -> bool:
+        return m["event_ticker"].endswith(f"{a}{h}") or m["event_ticker"].endswith(f"{h}{a}")
+
+    cands = [m for m in markets if pair(m) and m["event_ticker"].split("-")[1].startswith(day)] or [m for m in markets if pair(m)]
     out = {}
     for m in cands:
         side = m["ticker"].rsplit("-", 1)[1]
@@ -181,46 +163,45 @@ def match_kalshi(game, markets: list[dict]) -> dict:
     return out
 
 
-POLY_NAMES = {}
+def _poly_start(raw: str) -> pd.Timestamp | None:
+    try:
+        ts = pd.Timestamp(raw)
+        return pd.Timestamp(raw.replace(" ", "T")).tz_localize("UTC") if ts.tz is None else ts
+    except (ValueError, TypeError):
+        return None
 
 
 def match_polymarket(game, markets: list[dict], team_names: dict) -> dict:
-    t0 = game.start
-    out = {}
+    """Both sides' bid/ask for one game from the Gamma moneyline list: same two
+    display names, start within 3h. Gamma's best_bid/best_ask refer to outcome 0's
+    token; outcome 1 is the complement."""
+    hn, an = team_names.get(game.home_id, ""), team_names.get(game.away_id, "")
+    if not (hn and an):
+        return {}
     for m in markets:
-        try:
-            ts = pd.Timestamp(m["start"].replace(" ", "T")).tz_localize("UTC") if pd.Timestamp(m["start"]).tz is None else pd.Timestamp(m["start"])
-        except Exception:  # noqa: BLE001
+        ts = _poly_start(m["start"])
+        if ts is None or abs((ts - game.start).total_seconds()) > 3 * 3600 or len(m["outcomes"]) != 2:
             continue
-        if abs((ts - t0).total_seconds()) > 3 * 3600 or len(m["outcomes"]) != 2:
-            continue
-        hn, an = team_names.get(game.home_id, ""), team_names.get(game.away_id, "")
         o = m["outcomes"]
-        if not ({hn, an} <= {o[0], o[1]} if hn and an else False):
+        if not ({hn, an} <= {o[0], o[1]}):
             continue
-        i_home = o.index(hn)
         bb, ba = m["best_bid"], m["best_ask"]
         if bb is None or ba is None:
             continue
-        # gamma best_bid/best_ask refer to outcome 0's token; outcome 1 is the complement
+        i_home = o.index(hn)
         q0 = dict(bid=float(bb), ask=float(ba))
         q1 = dict(bid=1 - float(ba), ask=1 - float(bb))
-        out["home"] = dict(q0 if i_home == 0 else q1, token=m["tokens"][i_home], condition_id=m["condition_id"], liquidity=m["liquidity"])
-        out["away"] = dict(q1 if i_home == 0 else q0, token=m["tokens"][1 - i_home], condition_id=m["condition_id"], liquidity=m["liquidity"])
-        break
-    return out
+        meta = dict(condition_id=m["condition_id"], liquidity=m["liquidity"])
+        return {"home": dict(q0 if i_home == 0 else q1, token=m["tokens"][i_home], **meta),
+                "away": dict(q1 if i_home == 0 else q0, token=m["tokens"][1 - i_home], **meta)}
+    return {}
 
 
 def team_display_names(league: str) -> dict:
-    sport, lg = espn.LEAGUES[league]
-    j = espn.get(f"{espn.SITE}/{sport}/{lg}/teams?limit=100")
-    out = {}
-    for t in j["sports"][0]["leagues"][0]["teams"]:
-        out[str(t["team"]["id"])] = t["team"]["displayName"]
-    return out
+    return espn.teams(league, "id", "displayName")
 
 
-# ---------------------------------------------------------------- tickets
+# ---------------------------------------------------------------- pricing and sizing
 def price_edge(p: float, ask: float, fee_rate: float) -> tuple[float, float]:
     """Taker buys the side at `ask` on a $1 contract; fee = fee_rate*ask*(1-ask)
     per contract. Returns (net decimal odds, edge = p*dec - 1)."""
@@ -229,11 +210,34 @@ def price_edge(p: float, ask: float, fee_rate: float) -> tuple[float, float]:
     return dec, p * dec - 1
 
 
+def best_price(p_home: float, quotes: dict[str, dict]) -> dict | None:
+    """Highest-edge executable side across venues for the blend probability."""
+    best = None
+    for venue, q in quotes.items():
+        for side in ("home", "away"):
+            ask = (q.get(side) or {}).get("ask", np.nan)
+            if not (np.isfinite(ask) and 0 < ask < 1):
+                continue
+            p = p_home if side == "home" else 1 - p_home
+            dec, edge = price_edge(p, ask, VENUE_FEE[venue])
+            if best is None or edge > best["edge"]:
+                best = dict(venue=venue, side=side, ask=ask, dec=dec, edge=edge, p=p)
+    return best
+
+
+def kelly_stake(p: float, dec: float, rule: stats.BetRule = RULE) -> tuple[float, float]:
+    """(full Kelly fraction, dollar stake under the pre-registered fraction and cap)."""
+    b = dec - 1
+    kelly = max((b * p - (1 - p)) / b, 0)
+    return kelly, round(min(rule.kelly_frac * kelly, rule.stake_cap) * rule.bankroll, 2)
+
+
+# ---------------------------------------------------------------- tickets
 def tickets(day: date | None = None) -> None:
     day = day or date.today()
-    meta_all = {r["league"]: r["meta"] for r in json.load(open(ROOT / "data" / "backtest_results.json"))}
+    meta_all = {r["league"]: r["meta"] for r in load_json(BACKTEST_RESULTS)}
     sl = slate(day)
-    seen = {p["event_id"] for p in _read(PRED)}
+    seen = {p["event_id"] for p in read_jsonl(PRED)}
     if not sl.empty:
         sl = sl[~sl.event_id.isin(seen)].reset_index(drop=True)   # one forecast per game: the first one written
     if sl.empty:
@@ -245,126 +249,126 @@ def tickets(day: date | None = None) -> None:
             print(f"{lg}: no frozen hyper-parameters (backtest not run); skipped")
             continue
         fc = forecast(lg, g, meta_all[lg])
-        km = kalshi_quotes(lg)
-        pm = polymarket_quotes(lg)
-        names = team_display_names(lg)
+        km, pm, names = kalshi_quotes(lg), polymarket_quotes(lg), team_display_names(lg)
         for _, r in fc.iterrows():
             kq, pq = match_kalshi(r, km), match_polymarket(r, pm, names)
             dk = dict(ml_home=r.get("ml_home"), ml_away=r.get("ml_away"), provider=r.get("live_provider"),
                       dec_home=r.get("dec_home"), dec_away=r.get("dec_away"), p_home_shin=r.get("p_close_shin"))
-            p_model, p_blend = float(r.p_model) if np.isfinite(r.p_model) else None, float(r.p_blend) if np.isfinite(r.p_blend) else None
-            pred = dict(ts=_now(), day=day.isoformat(), league=lg, event_id=r.event_id, start=r.start.isoformat(),
-                        home=r.home_abbr, away=r.away_abbr, home_id=r.home_id, away_id=r.away_id,
-                        home_prob=r.get("home_prob_name"), away_prob=r.get("away_prob_name"),
-                        p_elo=float(r.p_elo), p_gauss=float(r.p_gauss) if np.isfinite(r.p_gauss) else None,
-                        p_pois=float(r.p_pois) if "p_pois" in r and np.isfinite(r.p_pois) else None,
-                        p_pois_pitch=float(r.p_pois_pitch) if "p_pois_pitch" in r and np.isfinite(r.p_pois_pitch) else None,
-                        mu_gauss=float(r.mu_gauss) if np.isfinite(r.mu_gauss) else None, rest_diff=float(r.rest_diff),
-                        p_model=p_model, p_blend=p_blend, sportsbook=dk, kalshi=kq, polymarket=pq, status="pending")
-            _append(PRED, pred)
-            # ticket: best executable price per side across prediction venues, blend probability, pre-registered rule
+            p_model, p_blend = finite(r.p_model), finite(r.p_blend)
+            append_jsonl(PRED, dict(
+                ts=utc_now(), day=day.isoformat(), league=lg, event_id=r.event_id, start=r.start.isoformat(),
+                home=r.home_abbr, away=r.away_abbr, home_id=r.home_id, away_id=r.away_id,
+                home_prob=r.get("home_prob_name"), away_prob=r.get("away_prob_name"),
+                p_elo=float(r.p_elo), p_gauss=finite(r.p_gauss), p_pois=finite(r.get("p_pois")), p_pois_pitch=finite(r.get("p_pois_pitch")),
+                mu_gauss=finite(r.mu_gauss), rest_diff=float(r.rest_diff),
+                p_model=p_model, p_blend=p_blend, sportsbook=dk, kalshi=kq, polymarket=pq, status="pending"))
             if p_blend is None:
                 continue
-            best = None
-            for venue, q, fee in (("kalshi", kq, KALSHI_FEE), ("polymarket", pq, POLY_FEE)):
-                for side in ("home", "away"):
-                    if side in q and np.isfinite(q[side].get("ask", np.nan)) and 0 < q[side]["ask"] < 1:
-                        p = p_blend if side == "home" else 1 - p_blend
-                        dec, edge = price_edge(p, q[side]["ask"], fee)
-                        if best is None or edge > best["edge"]:
-                            best = dict(venue=venue, side=side, ask=q[side]["ask"], dec=dec, edge=edge, p=p)
+            # ticket: best executable price per side across prediction venues, blend probability, pre-registered rule
+            best = best_price(p_blend, {"kalshi": kq, "polymarket": pq})
             if best and best["edge"] > RULE.edge_min:
-                b = best["dec"] - 1
-                kelly = max((b * best["p"] - (1 - best["p"])) / b, 0)
-                stake = round(min(RULE.kelly_frac * kelly, RULE.stake_cap) * RULE.bankroll, 2)
-                t = dict(ts=_now(), day=day.isoformat(), league=lg, event_id=r.event_id, start=r.start.isoformat(),
-                         home=r.home_abbr, away=r.away_abbr, **best, stake=stake, kelly_full=kelly,
-                         p_model=p_model, p_blend=p_blend, p_sportsbook=dk["p_home_shin"], status="pending")
-                _append(TICK, t)
+                kelly, stake = kelly_stake(best["p"], best["dec"])
+                append_jsonl(TICK, dict(ts=utc_now(), day=day.isoformat(), league=lg, event_id=r.event_id, start=r.start.isoformat(),
+                                        home=r.home_abbr, away=r.away_abbr, **best, stake=stake, kelly_full=kelly,
+                                        p_model=p_model, p_blend=p_blend, p_sportsbook=dk["p_home_shin"], status="pending"))
                 n_t += 1
                 print(f"TICKET {lg} {r.away_abbr}@{r.home_abbr} {best['side']} @ {best['venue']} ask {best['ask']:.3f} "
                       f"edge {best['edge']:+.3%} p_blend {best['p']:.3f} stake ${stake}")
             else:
                 e = f"{best['edge']:+.3%} ({best['venue']} {best['side']})" if best else "no venue quote"
-                print(f"PASS   {lg} {r.away_abbr}@{r.home_abbr} p_model {p_model:.3f} p_blend {p_blend:.3f} "
-                      f"book {dk['p_home_shin'] if dk['p_home_shin'] is not None else float('nan'):.3f} best edge {e}")
+                book = dk["p_home_shin"] if dk["p_home_shin"] is not None else float("nan")
+                print(f"PASS   {lg} {r.away_abbr}@{r.home_abbr} p_model {p_model:.3f} p_blend {p_blend:.3f} book {book:.3f} best edge {e}")
     print(f"{len(sl)} games on slate, {n_t} tickets")
 
 
 # ---------------------------------------------------------------- settlement
-def settle() -> None:
-    preds = _read(PRED)
-    ticks = _read(TICK)
-    done = {(r["kind"], r["event_id"]) for r in _read(SETTLED)}
-    finals: dict[str, dict] = {}
-    pending = [p for p in preds if ("pred", p["event_id"]) not in done] + [t for t in ticks if ("ticket", t["event_id"]) not in done]
-    days = {(p["league"], pd.Timestamp(p["start"]).date()) for p in pending}
+def log_loss(p: float, y: float) -> float:
+    return float(-np.log(np.clip(p if y == 1 else 1 - p, LOG_LOSS_FLOOR, 1)))
+
+
+def finals(days: set[tuple[str, date]]) -> dict[str, dict]:
+    """Completed games with scores for every (league, UTC date) needed. ESPN files a
+    game under its US date, so the day before and after are read too."""
+    out: dict[str, dict] = {}
     for lg, d in days:
         for dd in (d - timedelta(days=1), d, d + timedelta(days=1)):
             for e in espn.scoreboard(lg, dd):
                 r = espn.parse_event(lg, e)
                 if r["completed"] and r["home_score"] is not None:
-                    finals[r["event_id"]] = r
+                    out[r["event_id"]] = r
+    return out
+
+
+def _venue_ll(q: dict, y: float) -> float | None:
+    """Log-loss of a venue's own two-sided ask, normalised to a probability."""
+    h, a = (q.get("home") or {}).get("ask", np.nan), (q.get("away") or {}).get("ask", np.nan)
+    if not (np.isfinite(h) and np.isfinite(a)):
+        return None
+    return log_loss(h / (h + a), y)
+
+
+def settle() -> None:
+    preds, ticks = read_jsonl(PRED), read_jsonl(TICK)
+    done = {(r["kind"], r["event_id"]) for r in read_jsonl(SETTLED)}
+    pending = [p for p in preds if ("pred", p["event_id"]) not in done] + [t for t in ticks if ("ticket", t["event_id"]) not in done]
+    fin = finals({(p["league"], pd.Timestamp(p["start"]).date()) for p in pending})
+
+    def result(kind: str, row: dict) -> dict | None:
+        if (kind, row["event_id"]) in done or row["event_id"] not in fin:
+            return None
+        f = fin[row["event_id"]]
+        return None if f["home_score"] == f["away_score"] else f   # ties (NFL) are void, never settled
+
     n = 0
     for p in preds:
-        if ("pred", p["event_id"]) in done or p["event_id"] not in finals:
-            continue
-        f = finals[p["event_id"]]
-        if f["home_score"] == f["away_score"]:
+        if (f := result("pred", p)) is None:
             continue
         y = 1.0 if f["home_score"] > f["away_score"] else 0.0
-        row = dict(kind="pred", ts=_now(), event_id=p["event_id"], league=p["league"], day=p["day"], y=y,
+        row = dict(kind="pred", ts=utc_now(), event_id=p["event_id"], league=p["league"], day=p["day"], y=y,
                    home_score=f["home_score"], away_score=f["away_score"])
-        for k in ("p_model", "p_blend", "p_elo", "p_gauss", "p_pois", "p_pois_pitch"):
-            if p.get(k) is not None:
-                row[f"ll_{k}"] = -np.log(np.clip(p[k] if y == 1 else 1 - p[k], 1e-6, 1))
+        row.update({f"ll_{k}": log_loss(p[k], y) for k in FORECAST_COLS if p.get(k) is not None})
         pb = (p.get("sportsbook") or {}).get("p_home_shin")
         if pb is not None and np.isfinite(pb):
-            row["ll_book"] = -np.log(np.clip(pb if y == 1 else 1 - pb, 1e-6, 1))
-        for venue in ("kalshi", "polymarket"):
-            q = p.get(venue) or {}
-            if "home" in q and "away" in q and np.isfinite(q["home"].get("ask", np.nan)) and np.isfinite(q["away"].get("ask", np.nan)):
-                ph = q["home"]["ask"] / (q["home"]["ask"] + q["away"]["ask"])
-                row[f"ll_{venue}"] = -np.log(np.clip(ph if y == 1 else 1 - ph, 1e-6, 1))
-        _append(SETTLED, row)
+            row["ll_book"] = log_loss(pb, y)
+        for venue in VENUE_FEE:
+            if (ll := _venue_ll(p.get(venue) or {}, y)) is not None:
+                row[f"ll_{venue}"] = ll
+        append_jsonl(SETTLED, row)
         n += 1
     for t in ticks:
-        if ("ticket", t["event_id"]) in done or t["event_id"] not in finals:
-            continue
-        f = finals[t["event_id"]]
-        if f["home_score"] == f["away_score"]:
+        if (f := result("ticket", t)) is None:
             continue
         home_won = f["home_score"] > f["away_score"]
         won = home_won if t["side"] == "home" else not home_won
         pnl = t["stake"] * (t["dec"] - 1) if won else -t["stake"]
-        _append(SETTLED, dict(kind="ticket", ts=_now(), event_id=t["event_id"], league=t["league"], day=t["day"],
-                              venue=t["venue"], side=t["side"], stake=t["stake"], dec=t["dec"], won=bool(won), pnl=round(pnl, 2)))
+        append_jsonl(SETTLED, dict(kind="ticket", ts=utc_now(), event_id=t["event_id"], league=t["league"], day=t["day"],
+                                   venue=t["venue"], side=t["side"], stake=t["stake"], dec=t["dec"], won=bool(won), pnl=round(pnl, 2)))
         n += 1
     print(f"settled {n} rows")
     status()
 
 
-def status() -> None:
-    rows = _read(SETTLED)
+def status() -> str:
+    rows = read_jsonl(SETTLED)
     preds = [r for r in rows if r["kind"] == "pred"]
     ticks = [r for r in rows if r["kind"] == "ticket"]
-    L = [f"# paper status — {_now()}", "", f"predictions settled: {len(preds)}   tickets settled: {len(ticks)}   "
-         f"pending tickets: {len(_read(TICK)) - len(ticks)}", ""]
+    L = [f"# paper status — {utc_now()}", "", f"predictions settled: {len(preds)}   tickets settled: {len(ticks)}   "
+         f"pending tickets: {len(read_jsonl(TICK)) - len(ticks)}", ""]
     if preds:
         d = pd.DataFrame(preds)
         L += ["| forecast | n | mean log-loss |", "|---|---|---|"]
-        for c in [c for c in d.columns if c.startswith("ll_")]:
-            L.append(f"| {c[3:]} | {d[c].notna().sum()} | {d[c].mean():.4f} |")
+        L += [f"| {c[3:]} | {d[c].notna().sum()} | {d[c].mean():.4f} |" for c in d.columns if c.startswith("ll_")]
         L.append("")
-        L.append("Paired (book − model) log-loss, positive = model better: "
-                 + (f"{(d.ll_book - d.ll_model).mean():+.4f} on {int((d.ll_book.notna() & d.ll_model.notna()).sum())} games"
-                    if "ll_book" in d and "ll_model" in d else "n/a"))
+        paired = (f"{(d.ll_book - d.ll_model).mean():+.4f} on {int((d.ll_book.notna() & d.ll_model.notna()).sum())} games"
+                  if "ll_book" in d and "ll_model" in d else "n/a")
+        L.append(f"Paired (book − model) log-loss, positive = model better: {paired}")
     cl = [r for r in rows if r["kind"] == "clv"]
     if cl:
         c = pd.DataFrame(cl)
         L.append(f"CLV vs Kalshi pre-start mid: forecast side mean {c.forecast_clv.mean():+.4f} on {len(c)} games "
                  f"(share > 0: {(c.forecast_clv > 0).mean():.3f})"
-                 + (f"; tickets mean {c.ticket_clv.mean():+.4f} on {c.ticket_clv.notna().sum()}" if "ticket_clv" in c and c.ticket_clv.notna().any() else ""))
+                 + (f"; tickets mean {c.ticket_clv.mean():+.4f} on {c.ticket_clv.notna().sum()}"
+                    if "ticket_clv" in c and c.ticket_clv.notna().any() else ""))
     if ticks:
         t = pd.DataFrame(ticks)
         cum = t.pnl.cumsum()
@@ -374,18 +378,18 @@ def status() -> None:
               f"avg loss ${t[t.pnl < 0].pnl.mean() if (t.pnl < 0).any() else 0:.2f}"]
         by = t.groupby("day").pnl.sum()
         L.append(f"days positive: {(by > 0).sum()}/{len(by)}")
-    (ROOT / "docs" / "PAPER_STATUS.md").write_text("\n".join(L) + "\n", encoding="utf-8")
-    print("\n".join(L))
+    text = "\n".join(L) + "\n"
+    write_text(STATUS_MD, text)
+    print(text, end="")
+    return text
 
 
 # ---------------------------------------------------------------- quote snapshots (lead-lag dataset) and CLV
-SNAP = J / "quotes.jsonl"
-
-
 def snapshot() -> None:
     """Hourly: every pending prediction's Kalshi/Polymarket quotes and the DraftKings
     line right now. Builds the forward lead-lag dataset the backtest cannot supply."""
-    pend = [p for p in _read(PRED) if pd.Timestamp(p["start"]) > pd.Timestamp.now(tz="UTC")]
+    now = _now_ts()
+    pend = [p for p in read_jsonl(PRED) if pd.Timestamp(p["start"]) > now]
     if not pend:
         print("no pending games")
         return
@@ -401,13 +405,13 @@ def snapshot() -> None:
                 r = espn.parse_event(lg, e)
                 live[r["event_id"]] = r
         for p in ps:
-            g = pd.Series(dict(home_abbr=p["home"], away_abbr=p["away"], home_id=p["home_id"], away_id=p["away_id"],
-                               start=pd.Timestamp(p["start"])))
+            start = pd.Timestamp(p["start"])
+            g = pd.Series(dict(home_abbr=p["home"], away_abbr=p["away"], home_id=p["home_id"], away_id=p["away_id"], start=start))
             r = live.get(p["event_id"], {})
-            _append(SNAP, dict(ts=_now(), event_id=p["event_id"], league=lg, start=p["start"],
-                               hours_to_start=round((pd.Timestamp(p["start"]) - pd.Timestamp.now(tz="UTC")).total_seconds() / 3600, 2),
-                               kalshi=match_kalshi(g, km), polymarket=match_polymarket(g, pm, names),
-                               sportsbook=dict(ml_home=r.get("live_ml_home"), ml_away=r.get("live_ml_away"), provider=r.get("live_provider"))))
+            append_jsonl(SNAP, dict(ts=utc_now(), event_id=p["event_id"], league=lg, start=p["start"],
+                                    hours_to_start=round((start - now).total_seconds() / 3600, 2),
+                                    kalshi=match_kalshi(g, km), polymarket=match_polymarket(g, pm, names),
+                                    sportsbook=dict(ml_home=r.get("live_ml_home"), ml_away=r.get("live_ml_away"), provider=r.get("live_provider"))))
             n += 1
     print(f"snapshot: {n} games")
 
@@ -417,25 +421,23 @@ def clv() -> None:
     pre-start mid minus the price we paid (ticket) or the price that was available
     when the forecast was written (forecast side = the blend's favoured side)."""
     from pl.kalshi_hist import candles as kcandles
-    rows = _read(SETTLED)
+    rows = read_jsonl(SETTLED)
     done = {r["event_id"] for r in rows if r["kind"] == "clv"}
-    preds = {p["event_id"]: p for p in _read(PRED)}
-    ticks = {t["event_id"]: t for t in _read(TICK)}
+    ticks = {t["event_id"]: t for t in read_jsonl(TICK)}
+    now = _now_ts()
     n = 0
-    for ev, p in preds.items():
-        if ev in done or pd.Timestamp(p["start"]) > pd.Timestamp.now(tz="UTC"):
-            continue
+    for p in read_jsonl(PRED):
+        ev, start = p["event_id"], pd.Timestamp(p["start"])
         kq = p.get("kalshi") or {}
-        if "home" not in kq:
+        if ev in done or start > now or "home" not in kq:
             continue
         tk = kq["home"]["ticker"]
-        ser = tk.split("-")[0]
         try:
-            cs = kcandles(ser, tk, (pd.Timestamp(p["start"]) - pd.Timedelta(days=14)).isoformat(), pd.Timestamp(p["start"]).isoformat())
-        except Exception as e:  # noqa: BLE001
-            print(f"  clv {tk} ERR {e}")
+            cs = kcandles(tk.split("-")[0], tk, (start - pd.Timedelta(days=14)).isoformat(), start.isoformat())
+        except Exception as e:  # noqa: BLE001 - one market's history must not block the rest
+            log.warning("clv %s: %s", tk, e)
             continue
-        st = int(pd.Timestamp(p["start"]).timestamp())
+        st = int(start.timestamp())
         pre = [c for c in cs if c[1] <= st and c[2] is not None and c[3] is not None and (c[3] - c[2]) <= 0.10]
         if not pre:
             continue
@@ -443,33 +445,30 @@ def clv() -> None:
         side = "home" if (p.get("p_blend") or 0.5) >= 0.5 else "away"
         paid = kq[side]["ask"]
         close_side = close_home if side == "home" else 1 - close_home
-        row = dict(kind="clv", ts=_now(), event_id=ev, league=p["league"], day=p["day"], forecast_side=side,
+        row = dict(kind="clv", ts=utc_now(), event_id=ev, league=p["league"], day=p["day"], forecast_side=side,
                    forecast_ask=paid, kalshi_close_side=close_side, forecast_clv=round(close_side - paid, 4))
         t = ticks.get(ev)
         if t and t.get("venue") == "kalshi":
             tc = close_home if t["side"] == "home" else 1 - close_home
             row.update(ticket_side=t["side"], ticket_ask=t["ask"], ticket_clv=round(tc - t["ask"], 4))
-        _append(SETTLED, row)
+        append_jsonl(SETTLED, row)
         n += 1
     print(f"clv rows: {n}")
 
 
-def main(argv=None):
-    a = argv or sys.argv[1:]
-    cmd = a[0] if a else "tickets"
-    if cmd == "tickets":
-        tickets(date.fromisoformat(a[1]) if len(a) > 1 else None)
-    elif cmd == "settle":
+def main(argv: list[str] | None = None) -> None:
+    configure_logging()
+    ap = argparse.ArgumentParser(prog="pl paper", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("cmd", nargs="?", default="tickets", choices=("tickets", "settle", "status", "snapshot", "clv"))
+    ap.add_argument("day", nargs="?", type=date.fromisoformat, help="slate date for `tickets` (default today)")
+    a = ap.parse_args(argv)
+    if a.cmd == "tickets":
+        tickets(a.day)
+    elif a.cmd == "settle":
         clv()
         settle()
-    elif cmd == "status":
-        status()
-    elif cmd == "snapshot":
-        snapshot()
-    elif cmd == "clv":
-        clv()
     else:
-        raise SystemExit(__doc__)
+        {"status": status, "snapshot": snapshot, "clv": clv}[a.cmd]()
 
 
 if __name__ == "__main__":

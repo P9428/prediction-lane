@@ -9,20 +9,17 @@ usage: python -m pl.poly_hist [mlb nfl nhl nba]
 """
 from __future__ import annotations
 
+import argparse
 import json
 import sqlite3
-import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
-from pathlib import Path
+from datetime import date, timedelta
 
-import requests
+from pl import http, store
+from pl.core import DATA, configure_logging, log, to_float, utc_now
 
-ROOT = Path(__file__).resolve().parents[1]
-DB = ROOT / "data" / "poly_hist.sqlite"
-_s = requests.Session()
-_s.headers["User-Agent"] = "Mozilla/5.0 prediction-lane/0.1"
+DB = DATA / "poly_hist.sqlite"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS markets (condition_id TEXT PRIMARY KEY, league TEXT, event_title TEXT, question TEXT,
@@ -33,31 +30,14 @@ CREATE TABLE IF NOT EXISTS price_pulls (token TEXT PRIMARY KEY, n INTEGER, fetch
 """
 
 
-def _f(x):
-    try:
-        return float(x)
-    except (TypeError, ValueError):
-        return None
-
-
-def get(url, params, tries=4):
-    last = None
-    for i in range(tries):
-        try:
-            r = _s.get(url, params=params, timeout=60)
-            if r.status_code == 200:
-                return r.json()
-            last = RuntimeError(f"{r.status_code} {r.text[:100]}")
-        except requests.RequestException as e:
-            last = e
-        time.sleep(0.7 * (i + 1))
-    raise last
+def get(url: str, params: dict) -> list | dict:
+    """Gamma / CLOB GET: every non-200 is retried."""
+    return http.get_json(url, params, timeout=60, tries=4, backoff=0.7, fatal=())
 
 
 def pull_markets(c: sqlite3.Connection, league: str, year: str = "2026") -> int:
     """Weekly start-date windows: the events endpoint caps offset pagination at 1000,
     and ordering by event startDate mixes futures in, so the walk is by window."""
-    from datetime import date, timedelta
     n = 0
     d0 = date(int(year), 3, 15)
     while d0 < date.today() + timedelta(days=2):
@@ -66,8 +46,8 @@ def pull_markets(c: sqlite3.Connection, league: str, year: str = "2026") -> int:
             try:
                 evs = get("https://gamma-api.polymarket.com/events", dict(limit=100, offset=off, closed="true", tag_slug=league,
                                                                            start_date_min=d0.isoformat(), start_date_max=d1.isoformat()))
-            except RuntimeError as e:
-                print(f"  {league} {d0} offset {off}: {e}", flush=True)
+            except (http.HttpError, OSError) as e:
+                log.warning("%s %s offset %d: %s", league, d0, off, e)
                 break
             if not evs:
                 break
@@ -82,10 +62,10 @@ def pull_markets(c: sqlite3.Connection, league: str, year: str = "2026") -> int:
                         continue
                     prices = json.loads(m.get("outcomePrices") or "[]")
                     rows.append((m.get("conditionId"), league, e.get("title"), m.get("question"), m.get("outcomes"), m.get("outcomePrices"),
-                                 toks[0], toks[1], gs, m.get("endDate"), _f(m.get("volumeNum")), _f(m.get("liquidityNum")),
+                                 toks[0], toks[1], gs, m.get("endDate"), to_float(m.get("volumeNum")), to_float(m.get("liquidityNum")),
                                  (json.loads(m.get("outcomes"))[int(float(prices[1]) > float(prices[0]))] if len(prices) == 2 else None),
                                  json.dumps({k: m.get(k) for k in ("id", "slug", "closed", "umaResolutionStatus", "startDate", "endDate")}),
-                                 datetime.now(timezone.utc).isoformat(timespec="seconds")))
+                                 utc_now()))
             with c:
                 c.executemany("INSERT OR REPLACE INTO markets VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
             n += len(rows)
@@ -113,25 +93,30 @@ def pull_prices(c: sqlite3.Connection, league: str, workers: int = 4) -> int:
             try:
                 rows = f.result()
             except Exception as e:  # noqa: BLE001
-                print(f"  {t[:12]} ERR {e}", file=sys.stderr, flush=True)
+                log.warning("%s: %s", t[:12], e)
                 continue
             with c:
                 c.executemany("INSERT OR REPLACE INTO prices VALUES (?,?,?)", rows)
-                c.execute("INSERT OR REPLACE INTO price_pulls VALUES (?,?,?)", (t, len(rows), datetime.now(timezone.utc).isoformat(timespec="seconds")))
+                c.execute("INSERT OR REPLACE INTO price_pulls VALUES (?,?,?)", (t, len(rows), utc_now()))
             done += 1
             if done % 200 == 0:
                 print(f"  {league} history {done}/{len(todo)} {time.time() - t0:.0f}s", flush=True)
     return done
 
 
-def main(argv=None):
-    leagues = (argv or sys.argv[1:]) or ["mlb", "nfl"]
-    c = sqlite3.connect(DB, timeout=120)
-    c.executescript(SCHEMA)
-    for lg in leagues:
-        print(f"{lg}: {pull_markets(c, lg)} moneyline markets", flush=True)
-        pull_prices(c, lg)
-    c.close()
+def main(argv: list[str] | None = None) -> None:
+    configure_logging()
+    ap = argparse.ArgumentParser(prog="pl poly-hist", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("leagues", nargs="*", default=["mlb", "nfl"])
+    ap.add_argument("--workers", type=int, default=4)
+    a = ap.parse_args(argv)
+    c = store.open_db(DB, SCHEMA, wal=False)
+    try:
+        for lg in a.leagues:
+            print(f"{lg}: {pull_markets(c, lg)} moneyline markets", flush=True)
+            pull_prices(c, lg, a.workers)
+    finally:
+        c.close()
 
 
 if __name__ == "__main__":

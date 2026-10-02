@@ -1,14 +1,18 @@
-"""Probe every candidate free data source once; print status, bytes, latency, a snippet.
-Output is the evidence for docs/SOURCES.md. Nothing here is assumed; every row is measured."""
+"""Reachability probes. Nothing here is assumed; every row is measured.
+
+  python -m pl probe sources   -> data/probe_sources.json (the evidence behind docs/SOURCES.md)
+  python -m pl probe kalshi    -> settled-market depth and candlestick shape per Kalshi series
+"""
+from __future__ import annotations
+
+import argparse
 import json
-import sys
 import time
 
-import requests
-
-s = requests.Session()
-s.headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/128 Safari/537.36"
-s.headers["Accept"] = "*/*"
+from pl import http
+from pl.core import DATA, configure_logging, dump_json, epoch
+from pl.kalshi_hist import B as KALSHI
+from pl.kalshi_hist import get as kalshi_get
 
 PROBES = {
     "mlb_statsapi_schedule": "https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=2026-10-01&hydrate=probablePitcher,lineups,weather,officials",
@@ -95,27 +99,79 @@ PROBES = {
     "statmuse": "https://www.statmuse.com/mlb",
 }
 
+FIELDS = ("source", "status", "bytes", "secs", "content_type", "snippet")
 
-def main():
+
+def probe_one(name: str, url: str, cap: int = 300_000) -> dict:
+    t = time.time()
+    try:
+        r = http.fetch(url, timeout=20, browser=True, stream=True, headers={"Accept": "*/*"})
+        body = b""
+        for chunk in r.iter_content(65536):
+            body += chunk
+            if len(body) > cap:
+                break
+        r.close()
+        snippet = body[:100].decode("utf-8", "replace").replace("\n", " ").replace("\r", " ")
+        vals = (name, r.status_code, len(body), round(time.time() - t, 1), r.headers.get("content-type", "")[:28], snippet)
+    except Exception as e:  # noqa: BLE001 - the failure mode is the measurement
+        vals = (name, "ERR", 0, round(time.time() - t, 1), "", str(e)[:90])
+    return dict(zip(FIELDS, vals))
+
+
+def probe_sources() -> list[dict]:
     rows = []
-    for k, u in PROBES.items():
+    for name, url in PROBES.items():
+        r = probe_one(name, url)
+        rows.append(r)
+        print(f"{r['source']:30s} {str(r['status']):4s} {r['bytes']:>7} {r['secs']:>5}s {r['content_type']:28s} {r['snippet'][:80]}", flush=True)
+    dump_json(DATA / "probe_sources.json", rows, indent=1)
+    return rows
+
+
+def probe_kalshi(series: tuple[str, ...] = ("KXMLBGAME", "KXNHLGAME", "KXNBAGAME", "KXNFLGAME"), cap: int = 20_000) -> None:
+    for ser in series:
+        n, cur, first, last = 0, "", None, None
         t = time.time()
+        while True:
+            j = kalshi_get(f"{KALSHI}/markets", dict(limit=1000, status="settled", series_ticker=ser, cursor=cur))
+            ms = j.get("markets", [])
+            n += len(ms)
+            if ms:
+                first = first or ms[0]
+                last = ms[-1]
+            cur = j.get("cursor") or ""
+            if not cur or n > cap:
+                break
+        print(ser, "settled markets", n, f"{time.time() - t:.1f}s")
+        if first:
+            print("  newest", first["ticker"], first.get("open_time"), first.get("close_time"), first.get("result"), first.get("volume_fp"))
+            print("  oldest", last["ticker"], last.get("open_time"), last.get("close_time"), last.get("result"))
+    # candlesticks and trades for one settled MLB market
+    m = kalshi_get(f"{KALSHI}/markets", dict(limit=5, status="settled", series_ticker="KXMLBGAME"))["markets"][0]
+    tk = m["ticker"]
+    print("sample", tk, m.get("open_time"), m.get("close_time"), m.get("result"), m.get("expected_expiration_time"))
+    o, c = epoch(m["open_time"]), epoch(m["close_time"])
+    for per in (60, 1440):
         try:
-            r = s.get(u, timeout=20, stream=True)
-            ct = r.headers.get("content-type", "")[:28]
-            body = b""
-            for chunk in r.iter_content(65536):
-                body += chunk
-                if len(body) > 300000:
-                    break
-            r.close()
-            snippet = body[:100].decode("utf-8", "replace").replace("\n", " ").replace("\r", " ")
-            rows.append((k, r.status_code, len(body), round(time.time() - t, 1), ct, snippet))
-        except Exception as e:  # noqa: BLE001
-            rows.append((k, "ERR", 0, round(time.time() - t, 1), "", str(e)[:90]))
-        print(f"{rows[-1][0]:30s} {str(rows[-1][1]):4s} {rows[-1][2]:>7} {rows[-1][3]:>5}s {rows[-1][4]:28s} {rows[-1][5][:80]}", flush=True)
-    json.dump([dict(zip(["source", "status", "bytes", "secs", "content_type", "snippet"], r)) for r in rows],
-              open("data/probe_sources.json", "w"), indent=1)
+            cs = kalshi_get(f"{KALSHI}/series/KXMLBGAME/markets/{tk}/candlesticks",
+                            dict(start_ts=o - 3600, end_ts=c + 3600, period_interval=per)).get("candlesticks", [])
+        except http.HttpError as e:
+            print("candles", per, e)
+            continue
+        print("candles", per, "n", len(cs))
+        for x in cs[:2] + cs[-2:]:
+            print("  ", json.dumps(x)[:400])
+    tr = kalshi_get(f"{KALSHI}/markets/trades", dict(ticker=tk, limit=1000)).get("trades", [])
+    print("trades", len(tr), json.dumps(tr[:2])[:500])
+
+
+def main(argv: list[str] | None = None) -> None:
+    configure_logging()
+    ap = argparse.ArgumentParser(prog="pl probe", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("what", choices=("sources", "kalshi"))
+    a = ap.parse_args(argv)
+    probe_sources() if a.what == "sources" else probe_kalshi()
 
 
 if __name__ == "__main__":

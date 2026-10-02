@@ -11,17 +11,15 @@ diagnostic. Outputs docs/RESULTS.md and data/backtest_<league>.csv (per game).
 """
 from __future__ import annotations
 
+import argparse
 import json
-import sys
-from datetime import datetime, timezone
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 from pl import models, stats, store
+from pl.core import DATA, DOCS, LEAGUES, fmt, utc_now, write_text
 
-ROOT = Path(__file__).resolve().parents[1]
 GAUSS_HL = {"mlb": 150.0, "nba": 120.0, "nhl": 150.0, "nfl": 400.0}
 RULE = stats.BetRule(edge_min=0.02, kelly_frac=0.25, stake_cap=0.02, bankroll=1000.0)
 
@@ -157,16 +155,12 @@ def evaluate(league: str) -> dict:
             "ml_home", "ml_away", "ml_home_open", "ml_away_open", "p_close_shin", "p_open_shin", "p_elo", "p_gauss",
             "mu_gauss", "sigma_gauss", "p_model", "p_blend", "p_blend_open", "rest_diff"]
     keep += [c for c in ("p_pois", "p_pois_pitch", "pitch_adj_home", "pitch_adj_away", "lam_h", "lam_a") if c in df]
-    df.loc[t, keep].to_csv(ROOT / "data" / f"backtest_{league}.csv", index=False)
+    df.loc[t, keep].to_csv(DATA / f"backtest_{league}.csv", index=False)
     return out
 
 
-def _f(x, nd=4):
-    return "nan" if x is None or (isinstance(x, float) and not np.isfinite(x)) else f"{x:.{nd}f}"
-
-
 def render(results: list[dict]) -> str:
-    L = [f"# prediction-lane results — walk-forward, generated {datetime.now(timezone.utc).isoformat(timespec='seconds')}", ""]
+    L = [f"# prediction-lane results — walk-forward, generated {utc_now()}", ""]
     L.append("Primary test per league: cluster-robust Wald z on the model coefficient in "
              "`logit(y) = a + b·logit(p_close) + c·logit(p_model)` on the test seasons. "
              "Bonferroni over 4 leagues: p < 0.0125 to pass. The market is Shin-devigged ESPN BET / DraftKings close.")
@@ -176,65 +170,67 @@ def render(results: list[dict]) -> str:
     for r in results:
         pc = r["primary_close"]
         verdict = "INFORMATIVE" if (pc["p_wald"] < 0.0125 and pc["c_model"] > 0) else "REDUNDANT"
-        L.append(f"| {r['league']} | {r['tune_season']} | {r['test_seasons']} | {r['n_test']} | {_f(pc['c_model'],3)} | "
-                 f"{_f(pc['z_c'],2)} | {_f(pc['p_wald'])} | {_f(pc['p_lr'])} | {_f(pc['blend_w'],3)} | **{verdict}** |")
+        L.append(f"| {r['league']} | {r['tune_season']} | {r['test_seasons']} | {r['n_test']} | {fmt(pc['c_model'],3)} | "
+                 f"{fmt(pc['z_c'],2)} | {fmt(pc['p_wald'])} | {fmt(pc['p_lr'])} | {fmt(pc['blend_w'],3)} | **{verdict}** |")
     for r in results:
         L += ["", f"## {r['league'].upper()}", ""]
         L.append(f"- hyper-parameters frozen on {r['tune_season']}: `{json.dumps({k: {kk: (round(vv, 4) if isinstance(vv, float) else vv) for kk, vv in v.items()} for k, v in r['meta'].items()})}`")
         mc = r["market_cox"]
-        L.append(f"- market (close, Shin) Cox calibration: a={_f(mc['a'],3)} (z {_f(mc['z_a'],2)}), b={_f(mc['b'],3)} (z vs 1: {_f(mc['z_b'],2)}); "
-                 f"Hosmer-Lemeshow p={_f(r['market_hl']['p'])}; median overround {_f(r['overround_median'],4)}")
-        L.append(f"- skill exists to forecast? team-season win counts vs binomial: beta-binomial rho={_f(r['beta_binomial']['rho'],3)} "
-                 f"(LR p={_f(r['beta_binomial']['p'])}); split-half persistence of team win%: spearman={_f(r['split_half']['spearman'],3)} (p={_f(r['split_half']['p'])})")
+        L.append(f"- market (close, Shin) Cox calibration: a={fmt(mc['a'],3)} (z {fmt(mc['z_a'],2)}), b={fmt(mc['b'],3)} (z vs 1: {fmt(mc['z_b'],2)}); "
+                 f"Hosmer-Lemeshow p={fmt(r['market_hl']['p'])}; median overround {fmt(r['overround_median'],4)}")
+        L.append(f"- skill exists to forecast? team-season win counts vs binomial: beta-binomial rho={fmt(r['beta_binomial']['rho'],3)} "
+                 f"(LR p={fmt(r['beta_binomial']['p'])}); split-half persistence of team win%: spearman={fmt(r['split_half']['spearman'],3)} (p={fmt(r['split_half']['p'])})")
         mn = r["margin_norm"]
-        L.append(f"- margin residual (vs Gaussian model): sd={_f(mn['sd'],2)}, skew={_f(mn['skew'],2)}, excess kurt={_f(mn['kurt'],2)}, "
-                 f"JB p={_f(mn['jb_p'])}, AD stat={_f(mn['ad_stat'],2)} (5% crit {_f(mn['ad_crit5'],2)}), Student-t df={_f(mn['t_df'],1)}, AIC t-normal={_f(mn['aic_t']-mn['aic_norm'],1)}")
+        L.append(f"- margin residual (vs Gaussian model): sd={fmt(mn['sd'],2)}, skew={fmt(mn['skew'],2)}, excess kurt={fmt(mn['kurt'],2)}, "
+                 f"JB p={fmt(mn['jb_p'])}, AD stat={fmt(mn['ad_stat'],2)} (5% crit {fmt(mn['ad_crit5'],2)}), Student-t df={fmt(mn['t_df'],1)}, AIC t-normal={fmt(mn['aic_t']-mn['aic_norm'],1)}")
         sh, sa = r["score_dispersion_home"], r["score_dispersion_away"]
-        L.append(f"- score dispersion: home var/mean={_f(sh['var_over_mean'],2)} (CT z={_f(sh['ct_z'],1)}, NB size={_f(sh['nb_size'],1)}); "
-                 f"away var/mean={_f(sa['var_over_mean'],2)} (CT z={_f(sa['ct_z'],1)})")
+        L.append(f"- score dispersion: home var/mean={fmt(sh['var_over_mean'],2)} (CT z={fmt(sh['ct_z'],1)}, NB size={fmt(sh['nb_size'],1)}); "
+                 f"away var/mean={fmt(sa['var_over_mean'],2)} (CT z={fmt(sa['ct_z'],1)})")
         L += ["", "| model | log-loss | market log-loss | Δ (mkt−model) | 95% CI | Brier Δ | Cox b | Cox a |", "|---|---|---|---|---|---|---|---|"]
         for name, m in r["models"].items():
             s, c = m["skill"], m["cox"]
-            L.append(f"| {name} | {_f(s['ll_model'])} | {_f(s['ll_market'])} | {_f(s['d_ll'])} | [{_f(s['d_ll_ci'][0])}, {_f(s['d_ll_ci'][1])}] | "
-                     f"{_f(s['d_brier'])} | {_f(c['b'],3)} | {_f(c['a'],3)} |")
+            L.append(f"| {name} | {fmt(s['ll_model'])} | {fmt(s['ll_market'])} | {fmt(s['d_ll'])} | [{fmt(s['d_ll_ci'][0])}, {fmt(s['d_ll_ci'][1])}] | "
+                     f"{fmt(s['d_brier'])} | {fmt(c['b'],3)} | {fmt(c['a'],3)} |")
         so, mm = r["secondary_open"], r["market_over_model"]
         L.append("")
-        L.append(f"- vs OPENING line: c_model={_f(so['c_model'],3)}, z={_f(so['z_c'],2)}, p={_f(so['p_wald'])}, blend w={_f(so['blend_w'],3)} (n={so['n']})")
-        L.append(f"- sanity, market over model: c_market={_f(mm['c_model'],3)}, z={_f(mm['z_c'],2)} (must be large and positive)")
+        L.append(f"- vs OPENING line: c_model={fmt(so['c_model'],3)}, z={fmt(so['z_c'],2)}, p={fmt(so['p_wald'])}, blend w={fmt(so['blend_w'],3)} (n={so['n']})")
+        L.append(f"- sanity, market over model: c_market={fmt(mm['c_model'],3)}, z={fmt(mm['z_c'],2)} (must be large and positive)")
         L += ["", "| bet set | games | bets | staked $ | pnl $ | ROI | ROI 95% CI | P(ROI≤0) | hit | avg dec | max DD $ | losing months | payoff |", "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
         for name in ("bets_close", "bets_model_only_close", "bets_open"):
             b = r[name]
             if b.get("n_bets", 0) == 0:
                 L.append(f"| {name} | {b['n_games']} | 0 | 0 | 0 | — | — | — | — | — | — | — | — |")
                 continue
-            L.append(f"| {name} | {b['n_games']} | {b['n_bets']} | {b['staked']:.0f} | {b['pnl']:.0f} | {_f(b['roi'])} | "
-                     f"[{_f(b['roi_ci'][0])}, {_f(b['roi_ci'][1])}] | {_f(b['p_roi_le_0'],3)} | {_f(b['hit'],3)} | {_f(b['avg_dec'],3)} | "
-                     f"{b['max_drawdown']:.0f} | {b['losing_months']}/{b['months']} | {_f(b['payoff_ratio'],2)} |")
+            L.append(f"| {name} | {b['n_games']} | {b['n_bets']} | {b['staked']:.0f} | {b['pnl']:.0f} | {fmt(b['roi'])} | "
+                     f"[{fmt(b['roi_ci'][0])}, {fmt(b['roi_ci'][1])}] | {fmt(b['p_roi_le_0'],3)} | {fmt(b['hit'],3)} | {fmt(b['avg_dec'],3)} | "
+                     f"{b['max_drawdown']:.0f} | {b['losing_months']}/{b['months']} | {fmt(b['payoff_ratio'],2)} |")
         L += ["", "| season | n | c_model | z | p | Δ log-loss | ROI | ROI CI | bets |", "|---|---|---|---|---|---|---|---|---|"]
         for s, v in r["by_season"].items():
             i, k, b = v["info"], v["skill"], v["bets"]
-            roi = _f(b.get("roi")) if b.get("n_bets") else "—"
-            ci = f"[{_f(b['roi_ci'][0])}, {_f(b['roi_ci'][1])}]" if b.get("n_bets") else "—"
-            L.append(f"| {s} | {v['n']} | {_f(i['c_model'],3)} | {_f(i['z_c'],2)} | {_f(i['p_wald'])} | {_f(k['d_ll'])} | {roi} | {ci} | {b.get('n_bets',0)} |")
+            roi = fmt(b.get("roi")) if b.get("n_bets") else "—"
+            ci = f"[{fmt(b['roi_ci'][0])}, {fmt(b['roi_ci'][1])}]" if b.get("n_bets") else "—"
+            L.append(f"| {s} | {v['n']} | {fmt(i['c_model'],3)} | {fmt(i['z_c'],2)} | {fmt(i['p_wald'])} | {fmt(k['d_ll'])} | {roi} | {ci} | {b.get('n_bets',0)} |")
         L += ["", "market calibration (close, Shin), test seasons:", "", "| bin | n | mean p | realized | exact 95% CI | binom p |", "|---|---|---|---|---|---|"]
         for c in r["market_calib"]:
-            L.append(f"| {c['bin']} | {c['n']} | {_f(c['mean_p'],3)} | {_f(c['realized'],3)} | [{_f(c['lo'],3)}, {_f(c['hi'],3)}] | {_f(c['binom_p'],3)} |")
+            L.append(f"| {c['bin']} | {c['n']} | {fmt(c['mean_p'],3)} | {fmt(c['realized'],3)} | [{fmt(c['lo'],3)}, {fmt(c['hi'],3)}] | {fmt(c['binom_p'],3)} |")
     return "\n".join(L) + "\n"
 
 
-def main(argv=None):
-    leagues = (argv or sys.argv[1:]) or ["mlb", "nba", "nhl", "nfl"]
+def main(argv: list[str] | None = None) -> None:
+    ap = argparse.ArgumentParser(prog="pl backtest", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("leagues", nargs="*", default=list(LEAGUES))
+    a = ap.parse_args(argv)
     results = []
-    for lg in leagues:
+    for lg in a.leagues:
         print(f"== {lg}", flush=True)
         r = evaluate(lg)
         results.append(r)
         pc = r["primary_close"]
         print(f"   n={r['n_test']}  c_model={pc['c_model']:.3f}  z={pc['z_c']:.2f}  p={pc['p_wald']:.4f}  "
               f"d_ll={r['models']['p_model']['skill']['d_ll']:.4f}  bets={r['bets_close'].get('n_bets')}  roi={r['bets_close'].get('roi')}", flush=True)
-    (ROOT / "docs").mkdir(exist_ok=True)
-    (ROOT / "docs" / "RESULTS.md").write_text(render(results), encoding="utf-8")
-    json.dump(results, open(ROOT / "data" / "backtest_results.json", "w"), indent=1, default=lambda o: o.item() if hasattr(o, "item") else str(o))
+    write_text(DOCS / "RESULTS.md", render(results))
+    with open(DATA / "backtest_results.json", "w", encoding="utf-8") as fh:
+        json.dump(results, fh, indent=1, default=lambda o: o.item() if hasattr(o, "item") else str(o))
     print("wrote docs/RESULTS.md")
 
 

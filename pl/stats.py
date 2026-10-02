@@ -10,7 +10,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
-from scipy import optimize, special, stats as sps
+from scipy import optimize, special
+from scipy import stats as sps
 
 EPS = 1e-6
 
@@ -180,7 +181,6 @@ def calibration_table(y, p, edges=(0, .1, .2, .3, .4, .5, .6, .7, .8, .9, 1.0)):
         if n == 0:
             continue
         k = int(y[m].sum())
-        ci = sps.beta.ppf([0.025, 0.975], [k + 0.5, k + 1], [n - k + 1, n - k + 0.5]) if n else (np.nan, np.nan)
         lo_ci = 0.0 if k == 0 else sps.beta.ppf(0.025, k, n - k + 1)
         hi_ci = 1.0 if k == n else sps.beta.ppf(0.975, k + 1, n - k)
         rows.append(dict(bin=f"({lo:.1f}, {hi:.1f}]", n=n, mean_p=float(p[m].mean()), realized=k / n,

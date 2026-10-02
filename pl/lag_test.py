@@ -5,19 +5,20 @@ usage: python -m pl.lag_test   -> docs/KALSHI_LAG.md, data/kalshi_lag_rows.csv
 """
 from __future__ import annotations
 
+import argparse
 import json
 import re
 import sqlite3
-from datetime import datetime, timezone
-from pathlib import Path
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
 
-from pl import stats
+from pl import espn, stats
+from pl.core import DATA, DOCS, fmt, utc_now, write_text
 from pl.kalshi_hist import DB as KDB
+from pl.poly_hist import DB as PDB
 
-ROOT = Path(__file__).resolve().parents[1]
 FEE = 0.07
 EDGE_MIN = 0.02
 H_PRIMARY = 3
@@ -53,7 +54,7 @@ def load_kalshi() -> pd.DataFrame:
 
 
 def load_games(league: str) -> pd.DataFrame:
-    g = pd.read_csv(ROOT / "data" / f"backtest_{league}.csv", parse_dates=["start"])
+    g = pd.read_csv(DATA / f"backtest_{league}.csv", parse_dates=["start"])
     g["start"] = pd.to_datetime(g["start"], utc=True)
     g["edate_et"] = (g.start - pd.Timedelta(hours=4)).dt.date      # Kalshi tickers are dated in US Eastern
     return g
@@ -87,7 +88,6 @@ def join(km: pd.DataFrame, cd: pd.DataFrame) -> pd.DataFrame:
                             p_blend_open=x.p_blend_open, p_blend=x.p_blend))
     j = pd.DataFrame(out)
     # per-side probabilities and outcome
-    s = np.where(j.side_is_home, 1.0, -1.0)
     for c in ("p_open_shin", "p_close_shin", "p_model", "p_blend_open", "p_blend"):
         j[f"{c}_side"] = np.where(j.side_is_home, j[c], 1 - j[c])
     j["y_side"] = np.where(j.side_is_home, j.y_home, 1 - j.y_home)
@@ -128,8 +128,6 @@ VENUE_FEE = {"kalshi": FEE, "polymarket": POLY_FEE}
 def load_poly_join() -> pd.DataFrame:
     """Polymarket closed moneyline markets -> the same joined frame as join(),
     two side rows per market, prices from the outcome-0 hourly mid."""
-    from pl.poly_hist import DB as PDB
-    from pl.paper import team_display_names
     c = sqlite3.connect(PDB)
     m = pd.read_sql("SELECT * FROM markets", c)
     pr = pd.read_sql("SELECT * FROM prices", c)
@@ -138,12 +136,8 @@ def load_poly_join() -> pd.DataFrame:
     out = []
     for lg in sorted(m.league.unique()):
         g = load_games(lg)
-        from pl import espn
-        sport, lgx = espn.LEAGUES[lg]
-        tj = espn.get(f"{espn.SITE}/{sport}/{lgx}/teams?limit=100")
-        abbr_by_name = {t["team"]["displayName"]: t["team"]["abbreviation"] for t in tj["sports"][0]["leagues"][0]["teams"]}
+        abbr_by_name = {name: abbr for abbr, name in espn.teams(lg, "abbreviation", "displayName").items()}
         id_by_name = abbr_by_name
-        abbr_by_id = abbr_by_name
         gs = g.copy()
         gs["start_ts"] = gs.start.astype("int64") // 10 ** 9
         for r in m[m.league == lg].itertuples(index=False):
@@ -215,12 +209,8 @@ def rule(j: pd.DataFrame, p_col: str, h: int, B: int = 2000, seed: int = 0, fee:
     return out
 
 
-def _f(x, nd=4):
-    return "nan" if x is None or not np.isfinite(x) else f"{x:.{nd}f}"
-
-
 def render(j: pd.DataFrame, res: list[dict], prim: list[dict]) -> str:
-    L = [f"# Kalshi lag test — {datetime.now(timezone.utc).isoformat(timespec='seconds')}", "",
+    L = [f"# Kalshi lag test — {utc_now()}", "",
          f"Pre-registration: docs/PREREG_KALSHI_LAG.md. Joined {len(j)} Kalshi side-markets = {j.event_id.nunique()} games "
          f"({', '.join(f'{lg} {n}' for lg, n in j.groupby('league').event_id.nunique().items())}); "
          f"Kalshi result agrees with ESPN outcome on {float((j.y_kalshi == j.y_side).mean()):.4f} of sides.", "",
@@ -232,17 +222,17 @@ def render(j: pd.DataFrame, res: list[dict], prim: list[dict]) -> str:
             L.append(f"| {name} | {r['p']} | {r['n_quoted']} | 0 | — | — | — | — | — | — | — | — | FAIL (no bets) |")
             continue
         ok = r["roi_lo975"] > 0 and r["clv_lo975"] > 0
-        L.append(f"| {name} | {r['p']} | {r['n_quoted']} | {r['n_bets']} | {_f(r['roi'])} | [{_f(r['roi_ci'][0])}, {_f(r['roi_ci'][1])}] | "
-                 f"{_f(r['roi_lo975'])} | {_f(r['clv'])} | [{_f(r['clv_ci'][0])}, {_f(r['clv_ci'][1])}] | {_f(r['clv_lo975'])} | "
-                 f"{_f(r['hit'],3)} | {_f(r['avg_ask'],3)} | **{'PASS' if ok else 'FAIL'}** |")
+        L.append(f"| {name} | {r['p']} | {r['n_quoted']} | {r['n_bets']} | {fmt(r['roi'])} | [{fmt(r['roi_ci'][0])}, {fmt(r['roi_ci'][1])}] | "
+                 f"{fmt(r['roi_lo975'])} | {fmt(r['clv'])} | [{fmt(r['clv_ci'][0])}, {fmt(r['clv_ci'][1])}] | {fmt(r['clv_lo975'])} | "
+                 f"{fmt(r['hit'],3)} | {fmt(r['avg_ask'],3)} | **{'PASS' if ok else 'FAIL'}** |")
     L += ["", "## Diagnostics (not scored): every horizon, every reference probability, incl. the CLOSE which is not knowable at h", "",
           "| p used | h | quoted | bets | ROI | 95% CI | CLV | CLV 95% CI | CLV>0 share | hit | avg ask |", "|---|---|---|---|---|---|---|---|---|---|---|"]
     for r in res:
         if r.get("n_bets", 0) == 0:
             L.append(f"| {r['p']} | {r['h']} | {r['n_quoted']} | 0 | — | — | — | — | — | — | — |")
             continue
-        L.append(f"| {r['p']} | {r['h']} | {r['n_quoted']} | {r['n_bets']} | {_f(r['roi'])} | [{_f(r['roi_ci'][0])}, {_f(r['roi_ci'][1])}] | "
-                 f"{_f(r['clv'])} | [{_f(r['clv_ci'][0])}, {_f(r['clv_ci'][1])}] | {_f(r['clv_pos'],3)} | {_f(r['hit'],3)} | {_f(r['avg_ask'],3)} |")
+        L.append(f"| {r['p']} | {r['h']} | {r['n_quoted']} | {r['n_bets']} | {fmt(r['roi'])} | [{fmt(r['roi_ci'][0])}, {fmt(r['roi_ci'][1])}] | "
+                 f"{fmt(r['clv'])} | [{fmt(r['clv_ci'][0])}, {fmt(r['clv_ci'][1])}] | {fmt(r['clv_pos'],3)} | {fmt(r['hit'],3)} | {fmt(r['avg_ask'],3)} |")
     # how stale is Kalshi? mean |ask_h - close| and correlation of Kalshi mid with the sportsbook at each horizon
     L += ["", "## How far Kalshi's price sits from where it ends (all quoted sides)", "", "| h | quoted | mean(mid_h − kalshi_close) | mean abs | corr(mid_h, book close) | corr(mid_h, book open) | mean spread |", "|---|---|---|---|---|---|---|"]
     for h in H_ALL:
@@ -251,15 +241,15 @@ def render(j: pd.DataFrame, res: list[dict], prim: list[dict]) -> str:
         mid = (a + b) / 2
         if ok.sum() < 10:
             continue
-        L.append(f"| {h} | {int(ok.sum())} | {_f(np.mean(mid[ok] - j.kalshi_close.values[ok]))} | {_f(np.mean(np.abs(mid[ok] - j.kalshi_close.values[ok])))} | "
-                 f"{_f(np.corrcoef(mid[ok], j.p_close_shin_side.values[ok])[0,1],3)} | {_f(np.corrcoef(mid[ok], j.p_open_shin_side.values[ok])[0,1],3)} | {_f(np.mean(a[ok]-b[ok]),3)} |")
+        L.append(f"| {h} | {int(ok.sum())} | {fmt(np.mean(mid[ok] - j.kalshi_close.values[ok]))} | {fmt(np.mean(np.abs(mid[ok] - j.kalshi_close.values[ok])))} | "
+                 f"{fmt(np.corrcoef(mid[ok], j.p_close_shin_side.values[ok])[0,1],3)} | {fmt(np.corrcoef(mid[ok], j.p_open_shin_side.values[ok])[0,1],3)} | {fmt(np.mean(a[ok]-b[ok]),3)} |")
     # calibration of Kalshi's own pre-start mid
     L += ["", "## Kalshi pre-start mid, calibration (exact binomial)", "", "| bin | n | mean p | realized | 95% CI | binom p |", "|---|---|---|---|---|---|"]
     ok = np.isfinite(j.kalshi_close.values)
     for c in stats.calibration_table(j.y_side.values[ok], j.kalshi_close.values[ok]):
-        L.append(f"| {c['bin']} | {c['n']} | {_f(c['mean_p'],3)} | {_f(c['realized'],3)} | [{_f(c['lo'],3)}, {_f(c['hi'],3)}] | {_f(c['binom_p'],3)} |")
+        L.append(f"| {c['bin']} | {c['n']} | {fmt(c['mean_p'],3)} | {fmt(c['realized'],3)} | [{fmt(c['lo'],3)}, {fmt(c['hi'],3)}] | {fmt(c['binom_p'],3)} |")
     cox = stats.cox_calibration(j.y_side.values[ok], j.kalshi_close.values[ok], j.date.values[ok])
-    L.append(f"\nCox: a={_f(cox['a'],3)} (z {_f(cox['z_a'],2)}), b={_f(cox['b'],3)} (z vs 1 {_f(cox['z_b'],2)})")
+    L.append(f"\nCox: a={fmt(cox['a'],3)} (z {fmt(cox['z_a'],2)}), b={fmt(cox['b'],3)} (z vs 1 {fmt(cox['z_b'],2)})")
     return "\n".join(L) + "\n"
 
 
@@ -271,15 +261,21 @@ def main(venue: str = "kalshi"):
         j = load_poly_join()
     fee = VENUE_FEE[venue]
     tag = "kalshi" if venue == "kalshi" else "poly"
-    j.to_csv(ROOT / "data" / f"{tag}_lag_rows.csv", index=False)
+    j.to_csv(DATA / f"{tag}_lag_rows.csv", index=False)
     prim = [rule(j, "p_open_shin", H_PRIMARY, fee=fee), rule(j, "p_blend_open", H_PRIMARY, fee=fee)]
     res = [rule(j, p, h, B=1000, fee=fee) for p in ("p_open_shin", "p_blend_open", "p_model", "p_close_shin", "p_blend") for h in H_ALL]
     md = render(j, res, prim).replace("# Kalshi lag test", f"# {venue} lag test")
-    (ROOT / "docs" / f"{tag.upper()}_LAG.md").write_text(md, encoding="utf-8")
-    json.dump(dict(venue=venue, primaries=prim, diagnostics=res), open(ROOT / "data" / f"{tag}_lag_results.json", "w"), indent=1, default=float)
+    write_text(DOCS / f"{tag.upper()}_LAG.md", md)
+    with open(DATA / f"{tag}_lag_results.json", "w", encoding="utf-8") as fh:
+        json.dump(dict(venue=venue, primaries=prim, diagnostics=res), fh, indent=1, default=float)
     print(md[:3500])
 
 
+def cli(argv: list[str] | None = None) -> None:
+    ap = argparse.ArgumentParser(prog="pl lag", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("venue", nargs="?", default="kalshi", choices=sorted(VENUE_FEE))
+    main(ap.parse_args(argv).venue)
+
+
 if __name__ == "__main__":
-    import sys
-    main(sys.argv[1] if len(sys.argv) > 1 else "kalshi")
+    cli()

@@ -1,4 +1,5 @@
-"""SQLite store: one row per game, benchmark odds joined by event_id."""
+"""SQLite stores. `connect()` is the game/odds store; `open_db()` is the one
+way any module opens any SQLite file in this repo."""
 from __future__ import annotations
 
 import sqlite3
@@ -6,8 +7,9 @@ from pathlib import Path
 
 import pandas as pd
 
-ROOT = Path(__file__).resolve().parents[1]
-DB = ROOT / "data" / "pl.sqlite"
+from pl.core import DATA
+
+DB = DATA / "pl.sqlite"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS games (
@@ -36,36 +38,54 @@ ODDS_COLS = ["league", "event_id", "provider", "provider_id", "ml_home", "ml_awa
              "spread_home", "spread_home_open", "total", "total_open", "n_providers", "raw", "fetched_at"]
 
 
-def connect(path: Path = DB) -> sqlite3.Connection:
+def open_db(path: Path, schema: str = "", wal: bool = True) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     c = sqlite3.connect(path, timeout=120)
-    c.execute("PRAGMA journal_mode=WAL")
-    c.execute("PRAGMA synchronous=NORMAL")
-    c.executescript(SCHEMA)
+    if wal:
+        c.execute("PRAGMA journal_mode=WAL")
+        c.execute("PRAGMA synchronous=NORMAL")
+    if schema:
+        c.executescript(schema)
     return c
+
+
+def connect(path: Path = DB) -> sqlite3.Connection:
+    return open_db(path, SCHEMA)
 
 
 def upsert(c: sqlite3.Connection, table: str, cols: list[str], rows: list[dict]) -> None:
     if not rows:
         return
-    marks = ",".join(["?"] * len(cols))
-    q = f"INSERT OR REPLACE INTO {table} ({','.join(cols)}) VALUES ({marks})"
-    c.executemany(q, [tuple(r.get(k) for k in cols) for r in rows])
+    marks = ",".join("?" * len(cols))
+    c.executemany(f"INSERT OR REPLACE INTO {table} ({','.join(cols)}) VALUES ({marks})",
+                  [tuple(r.get(k) for k in cols) for r in rows])
+
+
+def scalar(path: Path, sql: str, *args) -> object:
+    """One value from a read-only query; opens and closes the file."""
+    c = sqlite3.connect(path)
+    try:
+        return c.execute(sql, args).fetchone()[0]
+    finally:
+        c.close()
 
 
 def games(league: str | None = None, completed_only: bool = True, path: Path = DB) -> pd.DataFrame:
-    c = connect(path)
     q = """SELECT g.*, o.provider, o.ml_home, o.ml_away, o.ml_home_open, o.ml_away_open,
                   o.spread_home, o.spread_home_open, o.total, o.total_open
            FROM games g LEFT JOIN odds o ON g.league = o.league AND g.event_id = o.event_id"""
-    w = []
+    where, params = [], []
     if league:
-        w.append(f"g.league = '{league}'")
+        where.append("g.league = ?")
+        params.append(league)
     if completed_only:
-        w.append("g.completed = 1 AND g.home_score IS NOT NULL AND g.away_score IS NOT NULL")
-    if w:
-        q += " WHERE " + " AND ".join(w)
-    df = pd.read_sql(q, c)
-    c.close()
+        where.append("g.completed = 1 AND g.home_score IS NOT NULL AND g.away_score IS NOT NULL")
+    if where:
+        q += " WHERE " + " AND ".join(where)
+    c = connect(path)
+    try:
+        df = pd.read_sql(q, c, params=params)
+    finally:
+        c.close()
     df["start"] = pd.to_datetime(df["start"], utc=True)
     return df.sort_values(["start", "event_id"]).reset_index(drop=True)

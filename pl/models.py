@@ -12,9 +12,9 @@ from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
-from scipy import optimize, stats as sps
+from scipy import stats as sps
 
-from pl.stats import expit, logit
+from pl.stats import expit
 
 LEAGUE_DEFAULTS = {
     # k, home_adv (Elo points), mov_scale, carry (fraction of rating kept at new season), goal model
@@ -219,7 +219,6 @@ def pitcher_adjustment(df: pd.DataFrame, prior_n: float = 12.0, half_life_games:
     team's runs allowed in his previous starts (the game log we have), shrunk to
     1.0 with `prior_n` pseudo-games and exponentially decayed. Returns the
     log-ratio adjustment to apply to the OPPONENT's lambda: negative = good pitcher."""
-    league_ra = {}
     hist: dict[str, list[tuple[float, float]]] = {}   # pitcher -> [(runs_allowed, decay_weight_index)]
     adj_home = np.zeros(len(df))
     adj_away = np.zeros(len(df))
@@ -227,7 +226,7 @@ def pitcher_adjustment(df: pd.DataFrame, prior_n: float = 12.0, half_life_games:
     run_mean = []
     for i, r in enumerate(df.itertuples(index=False)):
         base = np.mean(run_mean[-800:]) if run_mean else 4.5
-        for side, pid, ra in (("home", r.home_prob_id, r.away_score), ("away", r.away_prob_id, r.home_score)):
+        for side, pid, _ra in (("home", r.home_prob_id, r.away_score), ("away", r.away_prob_id, r.home_score)):
             if pid:
                 h = hist.get(pid, [])
                 if h:
@@ -266,7 +265,7 @@ def rest_days(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
     ra = np.full(len(df), 7.0)
     d = df.start.dt.floor("D").values
     for i, r in enumerate(df.itertuples(index=False)):
-        for side, team, arr in (("h", r.home_id, rh), ("a", r.away_id, ra)):
+        for team, arr in ((r.home_id, rh), (r.away_id, ra)):
             if team in last:
                 arr[i] = min(7.0, (d[i] - last[team]) / np.timedelta64(1, "D"))
         last[r.home_id] = d[i]

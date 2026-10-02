@@ -1,6 +1,6 @@
-# VERDICT — read from the RI belief state, run c23a130d565a
+# VERDICT — read from the RI belief state, run 465ac9bbbbf5
 
-log entries 27, root at read `c23a130d565a1601…`, file `data\evidence\pl_c23a130d565a.ri`; replay with `python -m pl.evidence replay data\evidence\pl_c23a130d565a.ri`
+log entries 27, root at read `465ac9bbbbf5dd9b…`, file `data\evidence\pl_465ac9bbbbf5.ri`; replay with `python -m pl evidence replay data\evidence\pl_465ac9bbbbf5.ri`
 
 | proposition | rule | verdict |
 |---|---|---|

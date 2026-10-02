@@ -9,22 +9,24 @@ Log order on every run:
   assertion     one per measured decision cell with its numbers as rule-readable fields
   verdict       the strings read from the belief state, with the log root and size
 
-  python -m pl.evidence run              -> data/evidence/pl_<runid>.ri + docs/VERDICT.md
-  python -m pl.evidence replay <file>    -> re-submits every entry, re-verifies signatures and root
+  python -m pl evidence run              -> data/evidence/pl_<runid>.ri + docs/VERDICT.md
+  python -m pl evidence replay <file>    -> re-submits every entry, re-verifies signatures and root
 """
 from __future__ import annotations
 
+import argparse
 import hashlib
-import json
 import math
 import os
-import sqlite3
 import sys
-from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
+import numpy as np
+
+from pl import store
+from pl.core import DATA, DOCS, JOURNAL, LEAGUES, ROOT, epoch, load_json, read_jsonl, write_text
+
 RI_ROOT = os.environ.get("PL_RI_ROOT", r"C:\Users\newce\Reality-Infrastructure\reference-implementation")
 if RI_ROOT not in sys.path:
     sys.path.insert(0, RI_ROOT)
@@ -40,9 +42,9 @@ ANCHOR_ID = "prediction-lane"
 ANCHOR_SEED = b"prediction-lane-evidence-v1"
 ASSERTION_MASS = Decimal("0.9")
 ALPHA = Decimal("0.05")
-LEAGUES = ("mlb", "nba", "nhl", "nfl")
 Q = Decimal("0.00000001")
-EVID = ROOT / "data" / "evidence"
+EVID = DATA / "evidence"
+LAG_UNMEASURED = dict(roi=Decimal(0), roi_lo975=Decimal(-1), clv=Decimal(0), clv_lo975=Decimal(-1))
 
 
 def _fld(n):
@@ -92,13 +94,6 @@ def _clean(x):
     if isinstance(x, dict):
         return {str(k): _clean(v) for k, v in x.items()}
     return str(x)
-
-
-def ltime_of(iso: str) -> int:
-    t = datetime.fromisoformat(iso.replace("Z", "+00:00"))
-    if t.tzinfo is None:
-        t = t.replace(tzinfo=timezone.utc)
-    return int(t.timestamp())
 
 
 def sha256_file(p: Path) -> str:
@@ -207,7 +202,7 @@ class Evidence:
         return data
 
     @classmethod
-    def load(cls, path: Path) -> "Evidence":
+    def load(cls, path: Path) -> Evidence:
         run = decode(path.read_bytes())
         if not isinstance(run, dict) or run.get("kind") != "prediction_lane_run":
             raise EvidenceError("not a prediction_lane_run file")
@@ -232,23 +227,34 @@ class Evidence:
 
 
 # ---------------------------------------------------------------- the run
-def _as_of_store() -> int:
-    c = sqlite3.connect(ROOT / "data" / "pl.sqlite")
-    t = c.execute("SELECT max(fetched_at) FROM games").fetchone()[0]
-    c.close()
-    return ltime_of(t)
+def _lag_assertions(ev: Evidence, prefix: str, results: Path, db: Path, pull_table: str, detail: dict) -> None:
+    """Capture a venue's history store and lag results, then assert P1/P2 under
+    lag-primary. Fields that were not measured are pinned to a failing value so
+    the rule reads FAIL rather than NOT_MEASURED."""
+    if not results.exists():
+        return
+    as_of = epoch(store.scalar(db, f"SELECT max(fetched_at) FROM {pull_table}"))
+    ev.capture(db.name, db, as_of, dict(markets=store.scalar(db, "SELECT count(*) FROM markets")))
+    ev.capture(results.name, results, as_of)
+    for name, pr in zip(("P1", "P2"), load_json(results)["primaries"]):
+        fields = dict(roi=q(pr.get("roi")), roi_lo975=q(pr.get("roi_lo975")), clv=q(pr.get("clv")),
+                      clv_lo975=q(pr.get("clv_lo975")), n_bets=int(pr.get("n_bets", 0)), n_quoted=int(pr.get("n_quoted", 0)))
+        if any(v is None for v in fields.values()):
+            fields.update(LAG_UNMEASURED)
+        ev.assertion(f"lag:{prefix}{name}", f"lag:{prefix}{name}", ("beatable", "efficient"), "beatable", as_of, fields,
+                     dict(p=pr.get("p"), h=pr.get("h"), **detail))
 
 
 def run() -> dict:
     ev = Evidence()
-    ev.prereg("primary", ROOT / "docs" / "PREREGISTRATION.md")
-    ev.prereg("kalshi-lag", ROOT / "docs" / "PREREG_KALSHI_LAG.md")
+    ev.prereg("primary", DOCS / "PREREGISTRATION.md")
+    ev.prereg("kalshi-lag", DOCS / "PREREG_KALSHI_LAG.md")
     for rid, spec in RULE_SPECS.items():
         ev.rule(rid, 1, spec)
-    as_of = _as_of_store()
-    ev.capture("pl.sqlite", ROOT / "data" / "pl.sqlite", as_of)
-    br = ROOT / "data" / "backtest_results.json"
-    results = json.load(open(br))
+    as_of = epoch(store.scalar(store.DB, "SELECT max(fetched_at) FROM games"))
+    ev.capture("pl.sqlite", store.DB, as_of)
+    br = DATA / "backtest_results.json"
+    results = load_json(br)
     ev.capture("backtest_results.json", br, as_of)
     # --- lane assertions: one per league, close (primary) and open (secondary, same rule, Bonferroni over 4)
     for r in results:
@@ -262,49 +268,16 @@ def run() -> dict:
                 continue
             ev.assertion(f"lane:{lg}:{sample}", f"lane:{lg}:{sample}", ("informative", "redundant"), "informative", as_of,
                          fields, dict(test_seasons=r["test_seasons"], tune_season=r["tune_season"], blend_w=pc["blend_w"]))
-    # --- Kalshi lag primaries, if measured
-    lag = ROOT / "data" / "kalshi_lag_results.json"
-    if lag.exists():
-        kh = ROOT / "data" / "kalshi_hist.sqlite"
-        c = sqlite3.connect(kh)
-        k_as_of = ltime_of(c.execute("SELECT max(fetched_at) FROM candle_pulls").fetchone()[0])
-        n_m = c.execute("SELECT count(*) FROM markets").fetchone()[0]
-        c.close()
-        ev.capture("kalshi_hist.sqlite", kh, k_as_of, dict(markets=n_m))
-        ev.capture("kalshi_lag_results.json", lag, k_as_of)
-        L = json.load(open(lag))
-        for name, pr in zip(("P1", "P2"), L["primaries"]):
-            fields = dict(roi=q(pr.get("roi")), roi_lo975=q(pr.get("roi_lo975")), clv=q(pr.get("clv")),
-                          clv_lo975=q(pr.get("clv_lo975")), n_bets=int(pr.get("n_bets", 0)), n_quoted=int(pr.get("n_quoted", 0)))
-            if any(v is None for v in fields.values()):
-                fields.update(roi=Decimal(0), roi_lo975=Decimal(-1), clv=Decimal(0), clv_lo975=Decimal(-1))
-            ev.assertion(f"lag:{name}", f"lag:{name}", ("beatable", "efficient"), "beatable", k_as_of, fields,
-                          dict(p=pr.get("p"), h=pr.get("h")))
-    plag = ROOT / "data" / "poly_lag_results.json"
-    if plag.exists():
-        ph = ROOT / "data" / "poly_hist.sqlite"
-        c = sqlite3.connect(ph)
-        p_as_of = ltime_of(c.execute("SELECT max(fetched_at) FROM price_pulls").fetchone()[0])
-        n_m = c.execute("SELECT count(*) FROM markets").fetchone()[0]
-        c.close()
-        ev.capture("poly_hist.sqlite", ph, p_as_of, dict(markets=n_m))
-        ev.capture("poly_lag_results.json", plag, p_as_of)
-        L = json.load(open(plag))
-        for name, pr in zip(("P1", "P2"), L["primaries"]):
-            fields = dict(roi=q(pr.get("roi")), roi_lo975=q(pr.get("roi_lo975")), clv=q(pr.get("clv")),
-                          clv_lo975=q(pr.get("clv_lo975")), n_bets=int(pr.get("n_bets", 0)), n_quoted=int(pr.get("n_quoted", 0)))
-            if any(v is None for v in fields.values()):
-                fields.update(roi=Decimal(0), roi_lo975=Decimal(-1), clv=Decimal(0), clv_lo975=Decimal(-1))
-            ev.assertion(f"lag:poly:{name}", f"lag:poly:{name}", ("beatable", "efficient"), "beatable", p_as_of, fields,
-                          dict(p=pr.get("p"), h=pr.get("h"), venue="polymarket"))
+    # --- venue lag primaries, where measured
+    _lag_assertions(ev, "", DATA / "kalshi_lag_results.json", DATA / "kalshi_hist.sqlite", "candle_pulls", {})
+    _lag_assertions(ev, "poly:", DATA / "poly_lag_results.json", DATA / "poly_hist.sqlite", "price_pulls", dict(venue="polymarket"))
     # --- paper kill rules, from the settled journal (fields only when the counts exist)
-    settled = ROOT / "journal" / "settled.jsonl"
+    settled = JOURNAL / "settled.jsonl"
     if settled.exists():
-        import numpy as np
-        rows = [json.loads(l) for l in settled.read_text(encoding="utf-8").splitlines() if l.strip()]
+        rows = read_jsonl(settled)
         preds = [x for x in rows if x["kind"] == "pred" and "ll_book" in x and "ll_model" in x]
         ticks = [x for x in rows if x["kind"] == "ticket"]
-        t_as_of = max((ltime_of(x["ts"]) for x in rows), default=as_of)
+        t_as_of = max((epoch(x["ts"]) for x in rows), default=as_of)
         d = np.array([x["ll_book"] - x["ll_model"] for x in preds]) if preds else np.array([])
         d_hi = (d.mean() + 1.96 * d.std(ddof=1) / math.sqrt(len(d))) if len(d) > 1 else 1.0
         ev.assertion("kill:K1", "kill:K1", ("kill", "live"), "kill", t_as_of,
@@ -344,7 +317,7 @@ def run() -> dict:
     ev.save(path)
     md = [f"# VERDICT — read from the RI belief state, run {run_id}", "",
           f"log entries {len(ev)}, root at read `{root[:16]}…`, file `{path.relative_to(ROOT)}`; "
-          f"replay with `python -m pl.evidence replay {path.relative_to(ROOT)}`", "",
+          f"replay with `python -m pl evidence replay {path.relative_to(ROOT)}`", "",
           "| proposition | rule | verdict |", "|---|---|---|"]
     for k, v in verd["lane"].items():
         md.append(f"| lane:{k} | lane-informative v1 | **{v}** |")
@@ -354,7 +327,7 @@ def run() -> dict:
         md.append(f"| kill:{k} | paper-{k} v1 | **{v}** |")
     md += ["", "A verdict here is the engine's projection of the logged claims under the logged rules; "
            "docs/RESULTS.md and docs/KALSHI_LAG.md are the measurements those claims were read from."]
-    (ROOT / "docs" / "VERDICT.md").write_text("\n".join(md) + "\n", encoding="utf-8")
+    write_text(DOCS / "VERDICT.md", "\n".join(md) + "\n")
     print("\n".join(md))
     return verd
 
@@ -369,12 +342,22 @@ def replay(path: Path) -> None:
     print(f"entries {len(ev)}  signatures re-verified  root@{size} {'IDENTICAL' if rr == root else 'MISMATCH'}")
     for prop in sorted(p for p in state["propositions"] if p.split(":")[0] in ("lane", "lag", "kill")):
         d = ev.decision(state, prop)
-        print(f"  {prop:16s} belief={'yes' if d['has_belief'] else 'no'} passed={d['passed']} excluded={[x[1] + 'v' + str(x[2]) for x in d['excluded']]}")
+        print(f"  {prop:16s} belief={'yes' if d['has_belief'] else 'no'} passed={d['passed']} "
+              f"excluded={[x[1] + 'v' + str(x[2]) for x in d['excluded']]}")
+
+
+def main(argv: list[str] | None = None) -> None:
+    ap = argparse.ArgumentParser(prog="pl evidence", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd")
+    sub.add_parser("run", help="log, rule, assert, read the verdict")
+    rp = sub.add_parser("replay", help="re-submit a saved run and re-verify its root")
+    rp.add_argument("file", type=Path)
+    a = ap.parse_args(argv)
+    if a.cmd == "replay":
+        replay(a.file if a.file.is_absolute() else ROOT / a.file)
+    else:
+        run()
 
 
 if __name__ == "__main__":
-    a = sys.argv[1:]
-    if a and a[0] == "replay":
-        replay(ROOT / a[1] if not Path(a[1]).is_absolute() else Path(a[1]))
-    else:
-        run()
+    main()

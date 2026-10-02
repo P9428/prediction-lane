@@ -7,16 +7,12 @@ usage: python -m pl.pull <league> <YYYY-MM-DD> <YYYY-MM-DD> [--odds] [--workers 
 from __future__ import annotations
 
 import argparse
-import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date, datetime, timezone
+from datetime import date
 
-from pl import espn, store
-
-
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+from pl import espn, http, store
+from pl.core import configure_logging, log, utc_now
 
 
 def pull_days(league: str, a: date, b: date, force: bool = False) -> int:
@@ -30,13 +26,13 @@ def pull_days(league: str, a: date, b: date, force: bool = False) -> int:
         try:
             rows = [espn.parse_event(league, e) for e in espn.scoreboard(league, d)]
         except Exception as e:  # noqa: BLE001 - a 5xx day is retried on the next run, never recorded as pulled
-            print(f"  {league} {key} FAILED {e}", file=sys.stderr, flush=True)
+            log.warning("%s %s failed: %s", league, key, e)
             continue
         for r in rows:
-            r["fetched_at"] = _now()
+            r["fetched_at"] = utc_now()
         with c:
             store.upsert(c, "games", store.GAME_COLS, rows)
-            c.execute("INSERT OR REPLACE INTO pulls VALUES (?,?,?,?)", (league, key, len(rows), _now()))
+            c.execute("INSERT OR REPLACE INTO pulls VALUES (?,?,?,?)", (league, key, len(rows), utc_now()))
         n_tot += len(rows)
         print(f"  {league} {key} {len(rows)}", flush=True)
     c.close()
@@ -55,14 +51,14 @@ def pull_nfl_weeks(seasons: list[int], force: bool = False) -> int:
                     continue
                 try:
                     evs = espn.scoreboard("nfl", None, dates=season, seasontype=stype, week=wk)
-                except RuntimeError:
+                except http.HttpError:
                     evs = []
                 rows = [espn.parse_event("nfl", e) for e in evs]
                 for r in rows:
-                    r["fetched_at"] = _now()
+                    r["fetched_at"] = utc_now()
                 with c:
                     store.upsert(c, "games", store.GAME_COLS, rows)
-                    c.execute("INSERT OR REPLACE INTO pulls VALUES (?,?,?,?)", ("nfl", key, len(rows), _now()))
+                    c.execute("INSERT OR REPLACE INTO pulls VALUES (?,?,?,?)", ("nfl", key, len(rows), utc_now()))
                 n_tot += len(rows)
                 print(f"  nfl {key} {len(rows)}", flush=True)
     c.close()
@@ -85,9 +81,9 @@ def pull_odds(league: str, workers: int = 6) -> int:
             try:
                 o = f.result()
             except Exception as e:  # noqa: BLE001 - one bad game must not stop the walk
-                print(f"  odds error {eid}: {e}", file=sys.stderr, flush=True)
+                log.warning("odds %s: %s", eid, e)
                 o = {}
-            batch.append(dict(o, league=league, event_id=eid, fetched_at=_now()))
+            batch.append(dict(o, league=league, event_id=eid, fetched_at=utc_now()))
             done += 1
             if len(batch) >= 50:
                 with c:
@@ -101,8 +97,9 @@ def pull_odds(league: str, workers: int = 6) -> int:
     return done
 
 
-def main(argv=None):
-    ap = argparse.ArgumentParser()
+def main(argv: list[str] | None = None) -> None:
+    configure_logging()
+    ap = argparse.ArgumentParser(prog="pl pull", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("league")
     ap.add_argument("start", nargs="?")
     ap.add_argument("end", nargs="?")

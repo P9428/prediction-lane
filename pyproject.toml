@@ -1,0 +1,32 @@
+[project]
+name = "prediction-lane"
+version = "0.2.0"
+description = "Forecast game outcomes from past performance, test against the closing line out of sample, paper-trade only where the forecast carries information the line lacks."
+requires-python = ">=3.12"
+dependencies = ["numpy>=2", "pandas>=2.2", "scipy>=1.14", "requests>=2.32"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[tool.ruff]
+line-length = 150
+target-version = "py312"
+src = ["."]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "W"]
+ignore = ["E741", "B905"]
+
+[tool.ruff.lint.per-file-ignores]
+# report renderers and source tables: long literal strings, kept on one line on purpose
+"pl/backtest.py" = ["E501"]
+"pl/lag_test.py" = ["E501"]
+"pl/sources.py" = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["pl"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q -p no:anchorpy -p no:cacheprovider"
+filterwarnings = ["ignore::FutureWarning"]
